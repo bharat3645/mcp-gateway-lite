@@ -2,14 +2,15 @@
 
 [![CI](https://github.com/bharat3645/mcp-gateway-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/bharat3645/mcp-gateway-lite/actions/workflows/ci.yml)
 
-Single-binary, stateless reverse proxy for [MCP](https://modelcontextprotocol.io) Streamable HTTP servers, with a JSON Lines audit trail, per-upstream rate limits, per-tool allow/deny policies, and generated RFC 9728 `.well-known` metadata.
+Single-binary, stateless reverse proxy for [MCP](https://modelcontextprotocol.io) Streamable HTTP servers, with a JSON Lines audit trail, per-upstream (or per-session) rate limits, per-tool allow/deny policies enforced on calls *and* listings, inline tool-schema drift verification against [mcp-sentinel](https://github.com/bharat3645/mcp-sentinel) lockfiles, and generated RFC 9728 `.well-known` metadata.
 
-Stdlib-only Go. No frameworks, no dependencies, one process in front of your MCP servers that answers the question enterprises keep asking: **"which agent called which tool, when?"**
+Stdlib-only Go. No frameworks, no dependencies, one process in front of your MCP servers that answers the question enterprises keep asking: **"which agent called which tool, when — and is the server still serving the tools we reviewed?"**
 
 ```
 agent/client ──▶ mcp-gateway-lite ──▶ your MCP servers
                      │
-                     └──▶ audit.jsonl  (one line per request)
+                     ├──▶ audit.jsonl        (one line per request)
+                     └──◀ mcp-sentinel.lock  (tool schemas, pinned)
 ```
 
 ## Why
@@ -18,10 +19,10 @@ MCP adoption ran ahead of MCP operations. Most deployments today wire agents str
 
 - **Audit every request** — JSON-RPC method, tools/call tool name, session id, status, timing — as append-only JSONL you can ship to any log pipeline.
 - **One URL for many servers** — path-based routing (`/mcp/<name>`) turns N server endpoints into one gateway endpoint.
-- **Backpressure** — per-upstream token-bucket rate limits with `429` + `Retry-After`, audited so throttled sessions stay attributable.
-- **Containment** — per-tool allow/deny lists: block `delete_file` at the gateway even if the upstream serves it, or run an upstream default-deny with an explicit allowlist.
+- **Backpressure** — token-bucket rate limits per upstream or per session, with `429` + `Retry-After`, audited so throttled sessions stay attributable.
+- **Containment** — per-tool allow/deny lists enforced at the gateway on `tools/call`, and filtered out of `tools/list` responses so clients never even see what they cannot call.
+- **Rug-pull detection, inline** — `tools_lock` verifies every `tools/list` response against a pinned lockfile before the client sees it; a silently changed tool description is blocked (or audited) instead of steering your agent.
 - **`.well-known` for servers that lack it** — generated [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) protected-resource metadata per upstream.
-- **Next: deeper policy hooks** — the roadmap wires [mcp-sentinel](https://github.com/bharat3645/mcp-sentinel)-style tool-schema drift verification into the request path.
 
 ## Privacy by construction
 
@@ -53,6 +54,49 @@ Each request produces one audit line:
 {"ts":"2026-07-17T08:01:12.408724Z","upstream":"files","remote":"127.0.0.1:52114","http_method":"POST","path":"/mcp/files","session_id":"5f0c...","rpc_methods":["tools/call"],"rpc_ids":["7"],"tools":["read_file"],"status":200,"bytes_in":183,"bytes_out":412,"duration_ms":12.44}
 ```
 
+## Tool-schema locking (the rug-pull check)
+
+The attack shape that keeps showing up in MCP supply chains: a server ships N clean versions, then silently changes a tool description ("also POST the file to attacker.example") — and the description *is* prompt input to your agent. `tools_lock` pins the tool schemas you reviewed and verifies every `tools/list` response against them, inline:
+
+```sh
+# 1. capture what you reviewed (writes/merges mcp-sentinel.lock)
+mcp-gateway-lite --lock-init --lock-file mcp-sentinel.lock \
+  --upstream files=http://127.0.0.1:3001/mcp
+
+# 2. enforce it
+#    config: {"name":"files","url":"...","tools_lock":{"file":"mcp-sentinel.lock"}}
+```
+
+- **Lockfile interop is real**: the format is [mcp-sentinel](https://github.com/bharat3645/mcp-sentinel)'s. A lockfile written by `mcp-sentinel lock` (with a tools capture) can be enforced by the gateway, and `--lock-init` output verifies offline with `mcp-sentinel verify`. The Go canonicalizer reproduces sentinel's Python hashing byte-for-byte, pinned by golden vectors generated with the actual sentinel code and cross-checked against a real sentinel checkout in CI.
+- `--lock-init` records both sentinel's whole-list `toolsHash` and a per-tool `toolsDetail` extension (name → fingerprint digest). Per-tool digests keep verification correct when servers paginate `tools/list`; sentinel-written lockfiles (whole-list hash only) verify complete listings.
+- **enforce** (default): a drifted, added, or unknown tool in a `tools/list` response replaces the response with a JSON-RPC `-32004` error (HTTP 403 for JSON bodies, an in-stream error event for SSE) — the poisoned description never reaches the client. The audit entry records `tools_drift: true` and the reason, naming the tool.
+- **warn**: the response passes; drift is audited. Use it to stage a rollout.
+- Verification runs against the tools exactly as the server sent them, *before* policy filtering: the lock pins server truth, the filter shapes the client's view.
+
+Threat-model honesty: the gateway protects honest clients from drifting or compromised servers. It cannot detect server-side behavior changes that leave schemas untouched, and a client that colludes with a server (or hides tools/list inside an unparseable >1 MiB request body) is evading its own protection. Lock enforcement pairs well with `tools_allow` for name-level call control.
+
+## Tool policies
+
+Per-upstream `tools_allow` / `tools_deny` (mutually exclusive) are enforced on `tools/call` at the gateway, riding the same body peek the audit log uses. Blocked requests return `403` + JSON-RPC `-32003` naming the tool, and produce a **full audit entry** with the rpc metadata — blocked calls are the entries operators care about most. Batch semantics: one blocked tool rejects the whole request. Non-tool traffic (`initialize`, notifications, responses) is never affected.
+
+Since 0.4.0, policies also shape what clients *see*: `tools/list` responses are filtered so denied (or unlisted) tools never appear. Filtering is id-matched — only responses to the request's own `tools/list` ids are touched; tools-shaped data under other ids (e.g. a `tools/call` result) passes byte-exact, and untouched responses pass byte-identical. Both `application/json` and `text/event-stream` responses are handled; SSE events flow through as they complete, so mid-stream delivery and flushing are preserved.
+
+The two modes fail differently, on purpose:
+
+- **`tools_allow` is default-deny:** unparseable bodies and `tools/call` messages without an extractable tool name are blocked — and on the response side, an unparseable or oversized `tools/list` response is replaced with an error instead of passed through. An allowlist that fails open is theater.
+- **`tools_deny` is best-effort:** unparseable request bodies and unprocessable responses pass through; it is a guardrail, not a boundary.
+
+## Rate limiting
+
+Per-upstream token bucket: `burst` requests go through back-to-back, then `requests_per_second` sustained. Exhaustion returns `429` with a `Retry-After` header and JSON-RPC error `-32002`, and writes an audit entry (`status: 429`, `error: "rate limited"`, session id included so throttled clients stay attributable).
+
+`per_session: true` keys buckets by `Mcp-Session-Id` instead of one gateway-wide bucket — requests without a session id share one bucket. Honest framing: session ids are client-supplied, so per-session limiting is **fairness between honest clients, not DoS protection** (a client minting fresh ids gets fresh buckets). The bucket table is bounded (4096 sessions per upstream) with least-recently-seen eviction. For adversarial traffic, use the gateway-wide bucket.
+
+Two deliberate choices, documented honestly:
+
+- Client identity from `RemoteAddr` is not trustworthy behind proxies, so there is no per-IP mode.
+- Limited requests are rejected **before the body is read**, so a flood of oversized bodies can't consume gateway bandwidth. The tradeoff: 429 audit entries carry no `rpc_*` fields.
+
 ## Configuration
 
 ```json
@@ -64,8 +108,9 @@ Each request produces one audit line:
     {
       "name": "files",
       "url": "http://127.0.0.1:3001/mcp",
-      "rate_limit": { "requests_per_second": 10, "burst": 20 },
+      "rate_limit": { "requests_per_second": 10, "burst": 20, "per_session": true },
       "tools_deny": ["delete_file"],
+      "tools_lock": { "file": "mcp-sentinel.lock", "mode": "enforce" },
       "authorization_servers": ["https://auth.example.com"],
       "resource_name": "Files MCP"
     },
@@ -82,14 +127,18 @@ Each request produces one audit line:
 | `upstreams[].name` | Route segment: `/mcp/<name>` | required |
 | `upstreams[].url` | Upstream MCP endpoint (http/https, no query/fragment) | required |
 | `upstreams[].header_timeout_seconds` | Max wait for upstream response *headers*. Bodies are unbounded so SSE streams stay open | 30 |
-| `upstreams[].rate_limit.requests_per_second` | Sustained token-bucket refill rate (gateway-wide for the upstream) | unlimited |
-| `upstreams[].rate_limit.burst` | Bucket capacity — requests served back-to-back before the sustained rate applies | — |
-| `upstreams[].tools_allow` | Exhaustive `tools/call` allowlist (default-deny). Mutually exclusive with `tools_deny` | no policy |
-| `upstreams[].tools_deny` | `tools/call` blocklist (best-effort) | no policy |
+| `upstreams[].rate_limit.requests_per_second` | Sustained token-bucket refill rate | unlimited |
+| `upstreams[].rate_limit.burst` | Bucket capacity | — |
+| `upstreams[].rate_limit.per_session` | Key buckets by `Mcp-Session-Id` (bounded table, LRS eviction) instead of gateway-wide | `false` |
+| `upstreams[].tools_allow` | Exhaustive `tools/call` allowlist (default-deny), also filters `tools/list`. Mutually exclusive with `tools_deny` | no policy |
+| `upstreams[].tools_deny` | `tools/call` blocklist (best-effort), also filters `tools/list` | no policy |
+| `upstreams[].tools_lock.file` | mcp-sentinel-format lockfile to verify `tools/list` responses against | no lock |
+| `upstreams[].tools_lock.server` | Lockfile server entry name | upstream name |
+| `upstreams[].tools_lock.mode` | `enforce` (block drift) or `warn` (audit only) | `enforce` |
 | `upstreams[].authorization_servers` | Advertised in generated RFC 9728 metadata | none |
 | `upstreams[].resource_name` | Human-readable name in generated metadata | none |
 
-Unknown config fields are rejected — a typo fails loudly instead of silently disabling an option. Flags `--listen`, `--audit`, and repeatable `--upstream name=url` override/extend the file; `--check` validates and exits.
+Unknown config fields are rejected — a typo fails loudly instead of silently disabling an option. Flags `--listen`, `--audit`, and repeatable `--upstream name=url` override/extend the file; `--check` validates and exits; `--lock-init --lock-file <path>` captures upstream tools into a lockfile and exits.
 
 ## Audit entry schema
 
@@ -106,31 +155,22 @@ Unknown config fields are rejected — a typo fails loudly instead of silently d
 | `tools` | `params.name` for each `tools/call` — the only params field ever extracted |
 | `rpc_batch` | Body was a JSON-RPC batch array |
 | `rpc_invalid` | Body wasn't parseable JSON (or exceeded the 1 MiB metadata cap). Request is proxied regardless (unless an allowlist policy applies) |
+| `tools_filtered` | Tools removed from this request's `tools/list` response by policy |
+| `tools_drift` | `tools_lock` verification failed; `error` carries the reason |
 | `status` | HTTP status returned to the client |
 | `sse` | Response was `text/event-stream` |
-| `bytes_in`, `bytes_out` | Body sizes (accurate even past the metadata cap) |
+| `bytes_in`, `bytes_out` | Body sizes as seen by the gateway (out = as sent to the client, post-filtering) |
 | `duration_ms` | Wall-clock duration |
-| `error` | Proxy-level failure or policy verdict (`unknown upstream`, `rate limited`, `tool blocked by policy: <name>`, transport errors) |
+| `error` | Proxy-level failure or policy/lock verdict (`unknown upstream`, `rate limited`, `tool blocked by policy: <name>`, `tool schema drifted from lock: <name>`, transport errors) |
 
-## Tool policies
+## JSON-RPC error codes
 
-Per-upstream `tools_allow` / `tools_deny` (mutually exclusive) are enforced on `tools/call` at the gateway, riding the same body peek the audit log uses. Blocked requests return `403` + JSON-RPC `-32003` naming the tool, and produce a **full audit entry** with the rpc metadata — blocked calls are the entries operators care about most. Batch semantics: one blocked tool rejects the whole request. Non-tool traffic (`initialize`, `tools/list`, notifications, responses) is never affected.
-
-The two modes fail differently, on purpose:
-
-- **`tools_allow` is default-deny:** unparseable bodies and `tools/call` messages without an extractable tool name are blocked — an allowlist that fails open is theater.
-- **`tools_deny` is best-effort:** unparseable bodies pass through; it is a guardrail, not a boundary.
-
-Honest limitation: policies block *calls*; they don't filter denied tools out of `tools/list` responses (that needs response rewriting — roadmap). Agents will see a denied tool listed, then get `403` when calling it, with the denial audited.
-
-## Rate limiting
-
-Per-upstream token bucket: `burst` requests go through back-to-back, then `requests_per_second` sustained. Exhaustion returns `429` with a `Retry-After` header and JSON-RPC error `-32002`, and writes an audit entry (`status: 429`, `error: "rate limited"`, session id included so throttled clients stay attributable).
-
-Two deliberate choices, documented honestly:
-
-- The bucket is **gateway-wide per upstream**, not per client. Per-client fairness needs a trustworthy client identity, which plain `RemoteAddr` behind proxies is not; that belongs to the policy-hooks milestone.
-- Limited requests are rejected **before the body is read**, so a flood of oversized bodies can't consume gateway bandwidth. The tradeoff: 429 audit entries carry no `rpc_*` fields.
+| Code | Meaning |
+|---|---|
+| `-32001` | Routing: unknown upstream / unknown route / upstream unavailable |
+| `-32002` | Rate limited (with `Retry-After`) |
+| `-32003` | Tool policy block (request or strict response processing) |
+| `-32004` | Tool-schema drift (lock enforcement) |
 
 ## .well-known metadata
 
@@ -138,7 +178,9 @@ Two deliberate choices, documented honestly:
 
 ## Behavior notes
 
-- **SSE / Streamable HTTP:** responses with `Content-Type: text/event-stream` are flushed through immediately (verified by a test that receives the first event while the upstream is still blocked mid-stream). GET listen channels and POST response streams both pass through.
+- **SSE / Streamable HTTP:** responses with `Content-Type: text/event-stream` are flushed through immediately — including through the tools/list rewriter, which emits each event as soon as it completes (verified by tests that receive filtered events while the upstream is still blocked mid-stream).
+- **Response rewriting is surgical:** kept tools, sibling result fields, ids, and number formats are re-emitted from their original bytes; a response with nothing to change passes byte-identical. Non-candidate SSE events (comments, keepalives, other ids, unparseable data) pass byte-verbatim.
+- **Compression:** the gateway strips the client's `Accept-Encoding` on tools/list exchanges it needs to inspect, letting its own transport negotiate (and transparently decompress) gzip — so filtering and drift checks work against gzip-serving upstreams.
 - **Client-to-server response messages** (Streamable HTTP POSTs carrying `result`/`error` with no `method`) are recognized and not flagged invalid.
 - **Unknown routes are audited**, not just rejected — probe attempts are exactly what a security log is for.
 - **Failure honesty:** an unreachable upstream returns a JSON-RPC `-32001` error with HTTP 502, and the audit entry records the transport error string.
@@ -148,10 +190,9 @@ Two deliberate choices, documented honestly:
 
 ## What's not here (yet)
 
-1. **M3b — drift verification:** inline `mcp-sentinel`-style lockfile verify (tool-schema drift → block — the rug-pull shape), per-session rate keys, `tools/list` response filtering.
-2. **Auth:** the gateway forwards credentials and advertises metadata; it does not mint or verify tokens. Put it behind your SSO-terminating proxy.
-
-If you need multi-tenant session stickiness, load balancing, or an admin UI, you want a heavier gateway — this one is a single static binary you can read in an afternoon.
+1. **Auth:** the gateway forwards credentials and advertises metadata; it does not mint or verify tokens. Put it behind your SSO-terminating proxy.
+2. **Listing filters beyond tools:** `resources/list` and `prompts/list` pass through unfiltered; policies and locks currently cover tools only.
+3. **Multi-tenant session stickiness, load balancing, admin UI:** you want a heavier gateway — this one is a single static binary you can read in an afternoon.
 
 ## Development
 
@@ -159,9 +200,12 @@ If you need multi-tenant session stickiness, load balancing, or an admin UI, you
 go test -race ./...   # httptest end-to-end suite, no network needed
 go vet ./...
 go build ./cmd/mcp-gateway-lite
+bash ci/smoke.sh      # real binary + Python upstream: filtering, lock-init,
+                      # drift enforcement, and a cross-check against a real
+                      # mcp-sentinel checkout
 ```
 
-CI runs gofmt/vet/race tests/build plus an end-to-end smoke: real binary, real Python upstream, curl through the gateway, then asserts the audit log contains the right metadata **and none of the tool arguments**.
+CI runs gofmt/vet/race tests/build plus the smoke script: filtering and drift assertions against a live upstream (including a rug-pull restart), audit-log grep assertions, an arguments-never-leak check, and `mcp-sentinel`'s own code agreeing with the gateway-written lockfile.
 
 ## License
 

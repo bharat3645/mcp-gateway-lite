@@ -3,6 +3,63 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-07-17
+
+M3b: the response side — tools/list filtering, inline tool-schema
+drift verification, per-session rate keys.
+
+### Added
+
+- `tools/list` response filtering: tool policies now shape what
+  clients see, not just what they can call. Filtering is id-matched
+  (only responses to the request's own tools/list ids are touched),
+  byte-preserving for kept tools and sibling fields, and covers both
+  `application/json` and `text/event-stream` responses. SSE events
+  are emitted as they complete, preserving mid-stream flushing;
+  non-candidate events pass byte-verbatim. Allowlist upstreams fail
+  closed on unprocessable responses (403/-32003, error events for
+  oversized SSE events); deny-list upstreams fail open. Audit entries
+  gain `tools_filtered`.
+- `tools_lock`: inline verification of `tools/list` responses against
+  an mcp-sentinel-format lockfile. `enforce` (default) replaces
+  drifted responses with JSON-RPC `-32004` (HTTP 403 for JSON, an
+  in-stream error event for SSE); `warn` passes and audits
+  (`tools_drift`). Verification runs before policy filtering, against
+  the tools as the server sent them. The Go canonicalizer reproduces
+  sentinel's Python hashing byte-for-byte, pinned by golden vectors
+  generated with the real sentinel code; CI cross-checks a live
+  gateway-written lockfile against an actual mcp-sentinel checkout.
+- `--lock-init` / `--lock-file`: a minimal MCP client (initialize,
+  notifications/initialized, paginated tools/list, JSON or SSE
+  responses) that writes or merges a sentinel-format lockfile:
+  sentinel's whole-list `toolsHash` plus a per-tool `toolsDetail`
+  extension that keeps verification pagination-proof. Foreign server
+  records in an existing lockfile are preserved.
+- `rate_limit.per_session`: token buckets keyed by `Mcp-Session-Id`
+  (empty id shares one bucket), bounded table (4096/upstream) with
+  least-recently-seen eviction. Documented honestly as fairness
+  between honest clients, not DoS protection.
+- Accept-Encoding is stripped from candidate tools/list exchanges so
+  the gateway's transport negotiates (and transparently decompresses)
+  compression — filtering and drift checks work against gzip-serving
+  upstreams.
+
+### Changed
+
+- JSON-RPC error codes: `-32004` for tool-schema drift (alongside
+  `-32001` routing, `-32002` rate limiting, `-32003` policy).
+- Version constant moved to `gateway.Version` (single source for the
+  CLI and the lock-init client).
+- The CI smoke test moved from an inline workflow script to
+  `ci/smoke.sh` and now covers filtering, lock-init, drift
+  enforcement (rug-pull restart), and the mcp-sentinel cross-check.
+
+### Fixed
+
+- `writeJSONError` now JSON-encodes error messages, so
+  client-controlled reason text (tool names) cannot produce an
+  invalid error body.
+
 ## [0.3.0] - 2026-07-17
 
 M3a: tool policies.
