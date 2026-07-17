@@ -1,0 +1,17 @@
+{
+  "listen": "127.0.0.1:8385",
+  "audit": {
+    "path": "audit.jsonl"
+  },
+  "upstreams": [
+    {
+      "name": "files",
+      "url": "http://127.0.0.1:3001/mcp"
+    },
+    {
+      "name": "search",
+      "url": "http://127.0.0.1:3002/mcp",
+      "header_timeout_seconds": 60
+    }
+  ]
+}

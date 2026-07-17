@@ -1,0 +1,4 @@
+/mcp-gateway-lite
+/audit.jsonl
+*.jsonl
+dist/
