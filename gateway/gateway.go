@@ -61,6 +61,10 @@ type Gateway struct {
 	// limits maps upstream name to its token bucket; a missing entry
 	// means unlimited.
 	limits map[string]*tokenBucket
+
+	// policies maps upstream name to its tool policy; nil means no
+	// policy.
+	policies map[string]*toolPolicy
 }
 
 // New validates cfg and builds a Gateway. The auditor must not be
@@ -77,6 +81,7 @@ func New(cfg Config, auditor *Auditor) (*Gateway, error) {
 	g.routes = make(map[string]*httputil.ReverseProxy, len(cfg.Upstreams))
 	g.upstreams = make(map[string]Upstream, len(cfg.Upstreams))
 	g.limits = make(map[string]*tokenBucket)
+	g.policies = make(map[string]*toolPolicy)
 	for _, u := range cfg.Upstreams {
 		p, err := newProxy(u)
 		if err != nil {
@@ -86,6 +91,9 @@ func New(cfg Config, auditor *Auditor) (*Gateway, error) {
 		g.upstreams[u.Name] = u
 		if u.RateLimit != nil {
 			g.limits[u.Name] = newTokenBucket(u.RateLimit.RequestsPerSecond, u.RateLimit.Burst, nil)
+		}
+		if pol := newToolPolicy(u); pol != nil {
+			g.policies[u.Name] = pol
 		}
 	}
 	return g, nil
@@ -183,6 +191,24 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 			rest := &countingReader{rc: orig, n: &extraIn}
 			r.Body = readCloser{Reader: io.MultiReader(bytes.NewReader(buf.Bytes()), rest), Closer: orig}
 		}
+	}
+
+	// Tool policy enforcement rides the same peek. Blocked requests
+	// are fully audited — they are the entries operators care about
+	// most.
+	if reason := g.policies[name].blockReason(sum); reason != "" {
+		e.RPCMethods = sum.Methods
+		e.RPCIDs = sum.IDs
+		e.Tools = sum.Tools
+		e.RPCBatch = sum.Batch
+		e.RPCInvalid = sum.Invalid
+		e.Status = http.StatusForbidden
+		e.BytesIn = buffered
+		e.DurationMS = float64(time.Since(start).Microseconds()) / 1000.0
+		e.Error = reason
+		g.auditor.Log(e)
+		writeJSONError(w, http.StatusForbidden, -32003, reason)
+		return
 	}
 
 	rec := &countingWriter{ResponseWriter: w}

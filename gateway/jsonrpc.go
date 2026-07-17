@@ -19,6 +19,11 @@ type rpcSummary struct {
 	// Tools lists params.name for each tools/call message.
 	Tools []string
 
+	// ToolCalls counts tools/call messages, including ones whose tool
+	// name could not be extracted — allowlist policies need to see
+	// that discrepancy instead of failing open.
+	ToolCalls int
+
 	// Batch reports whether the payload was a JSON-RPC batch array.
 	Batch bool
 
@@ -75,12 +80,15 @@ func addProbe(s *rpcSummary, p rpcProbe) {
 	if len(p.ID) > 0 && string(p.ID) != "null" {
 		s.IDs = append(s.IDs, string(p.ID))
 	}
-	if p.Method == "tools/call" && len(p.Params) > 0 {
-		var np struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(p.Params, &np); err == nil && np.Name != "" {
-			s.Tools = append(s.Tools, np.Name)
+	if p.Method == "tools/call" {
+		s.ToolCalls++
+		if len(p.Params) > 0 {
+			var np struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(p.Params, &np); err == nil && np.Name != "" {
+				s.Tools = append(s.Tools, np.Name)
+			}
 		}
 	}
 }

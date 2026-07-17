@@ -51,6 +51,17 @@ type Upstream struct {
 	// entry.
 	RateLimit *RateLimitConfig `json:"rate_limit,omitempty"`
 
+	// ToolsAllow, when non-empty, is an exhaustive allowlist for
+	// tools/call: any other tool is blocked with 403, and unparseable
+	// bodies are blocked too, because default-deny needs verifiable
+	// input. Mutually exclusive with ToolsDeny.
+	ToolsAllow []string `json:"tools_allow,omitempty"`
+
+	// ToolsDeny blocks matching tools/call names with 403.
+	// Unparseable bodies pass through — a blocklist is best-effort by
+	// nature.
+	ToolsDeny []string `json:"tools_deny,omitempty"`
+
 	// AuthorizationServers is advertised in the generated RFC 9728
 	// protected-resource metadata for this upstream.
 	AuthorizationServers []string `json:"authorization_servers,omitempty"`
@@ -144,6 +155,19 @@ func (c *Config) Validate() error {
 			}
 			if u.RateLimit.Burst < 1 {
 				return fmt.Errorf("upstream %q: rate_limit.burst must be >= 1", u.Name)
+			}
+		}
+		if len(u.ToolsAllow) > 0 && len(u.ToolsDeny) > 0 {
+			return fmt.Errorf("upstream %q: tools_allow and tools_deny are mutually exclusive", u.Name)
+		}
+		for _, tool := range u.ToolsAllow {
+			if strings.TrimSpace(tool) == "" {
+				return fmt.Errorf("upstream %q: tools_allow entries must not be empty", u.Name)
+			}
+		}
+		for _, tool := range u.ToolsDeny {
+			if strings.TrimSpace(tool) == "" {
+				return fmt.Errorf("upstream %q: tools_deny entries must not be empty", u.Name)
 			}
 		}
 		for _, as := range u.AuthorizationServers {

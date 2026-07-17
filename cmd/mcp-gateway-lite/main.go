@@ -19,7 +19,7 @@ import (
 )
 
 // version is reported by --version.
-const version = "0.2.0"
+const version = "0.3.0"
 
 // upstreamFlags collects repeatable --upstream name=url flags.
 type upstreamFlags []gateway.Upstream
