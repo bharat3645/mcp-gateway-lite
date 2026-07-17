@@ -50,6 +50,10 @@ type Entry struct {
 	// way.
 	RPCInvalid bool `json:"rpc_invalid,omitempty"`
 
+	// ToolsFiltered counts tools removed from this request's
+	// tools/list response by the upstream's tool policy.
+	ToolsFiltered int `json:"tools_filtered,omitempty"`
+
 	// Status is the HTTP status returned to the client.
 	Status int `json:"status"`
 
@@ -59,14 +63,16 @@ type Entry struct {
 	// BytesIn is the request body size in bytes.
 	BytesIn int64 `json:"bytes_in"`
 
-	// BytesOut is the response body size in bytes.
+	// BytesOut is the response body size in bytes, as sent to the
+	// client (a filtered tools/list response counts post-filtering).
 	BytesOut int64 `json:"bytes_out"`
 
 	// DurationMS is the wall-clock request duration in milliseconds.
 	DurationMS float64 `json:"duration_ms"`
 
-	// Error records proxy-level failures, e.g. an unreachable
-	// upstream or an unknown route.
+	// Error records proxy-level failures and policy verdicts, e.g. an
+	// unreachable upstream, an unknown route, or a response-processing
+	// block reason.
 	Error string `json:"error,omitempty"`
 }
 

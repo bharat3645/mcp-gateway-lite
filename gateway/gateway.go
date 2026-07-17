@@ -26,9 +26,15 @@ import (
 	"time"
 )
 
+// Version is the mcp-gateway-lite release version, shared by the CLI
+// and the lock-init client.
+const Version = "0.4.0"
+
 // maxRPCPeek caps how much of a request body is buffered for JSON-RPC
-// metadata extraction. Larger bodies are still proxied in full; they
-// are just recorded with rpc_invalid=true instead of being parsed.
+// metadata extraction, and how much of a tools/list response (or SSE
+// event) is buffered for verification and filtering. Larger request
+// bodies are still proxied in full; they are just recorded with
+// rpc_invalid=true instead of being parsed.
 const maxRPCPeek = 1 << 20
 
 // defaultHeaderTimeout bounds the wait for upstream response headers
@@ -41,6 +47,10 @@ type ctxKey int
 // proxyErrKey carries a *string that the proxy ErrorHandler fills in,
 // so the audit entry can record why an upstream call failed.
 const proxyErrKey ctxKey = 0
+
+// rewriteKey carries the *rewriteState for requests whose tools/list
+// responses need verification or filtering on the way back.
+const rewriteKey ctxKey = 1
 
 // Gateway is an http.Handler that routes /mcp/<name> to configured
 // upstreams and audits every request. Use New to build one.
@@ -211,9 +221,20 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If the request carries tools/list and this upstream has a tool
+	// policy, the response needs filtering on the way back so clients
+	// never see tools they cannot call.
+	var rw *rewriteState
+	if pol := g.policies[name]; pol != nil && len(sum.ToolsListIDs) > 0 {
+		rw = &rewriteState{ids: sum.ToolsListIDs, policy: pol, strict: pol.allow != nil}
+	}
+
 	rec := &countingWriter{ResponseWriter: w}
 	var proxyErr string
 	ctx := context.WithValue(r.Context(), proxyErrKey, &proxyErr)
+	if rw != nil {
+		ctx = context.WithValue(ctx, rewriteKey, rw)
+	}
 	proxy.ServeHTTP(rec, r.WithContext(ctx))
 
 	e.RPCMethods = sum.Methods
@@ -231,6 +252,12 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	e.DurationMS = float64(time.Since(start).Microseconds()) / 1000.0
 	if proxyErr != "" {
 		e.Error = proxyErr
+	}
+	if rw != nil {
+		e.ToolsFiltered = rw.filtered
+		if rw.note != "" && e.Error == "" {
+			e.Error = rw.note
+		}
 	}
 	g.auditor.Log(e)
 }
@@ -261,12 +288,19 @@ func newProxy(u Upstream) (*httputil.ReverseProxy, error) {
 	rp.Transport = transport
 	rp.Rewrite = func(pr *httputil.ProxyRequest) {
 		pr.SetXForwarded()
+		if pr.In.Context().Value(rewriteKey) != nil {
+			// The response may need parsing; a compressed body would
+			// defeat that. Losing upstream compression on tools/list
+			// exchanges is a fair trade.
+			pr.Out.Header.Del("Accept-Encoding")
+		}
 		out := *target
 		out.Path = joinPath(target.Path, strings.TrimPrefix(pr.In.URL.Path, prefix))
 		out.RawQuery = pr.In.URL.RawQuery
 		pr.Out.URL = &out
 		pr.Out.Host = target.Host
 	}
+	rp.ModifyResponse = modifyResponse
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		if p, ok := r.Context().Value(proxyErrKey).(*string); ok {
 			*p = err.Error()
@@ -364,8 +398,15 @@ type readCloser struct {
 	io.Closer
 }
 
+// writeJSONError writes a JSON-RPC-shaped HTTP error. The message is
+// JSON-encoded, so reason text that includes client-controlled values
+// (tool names) cannot produce an invalid body.
 func writeJSONError(w http.ResponseWriter, status, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	fmt.Fprintf(w, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":%d,\"message\":%q}}\n", code, msg)
+	body := append(jsonrpcError(nil, code, msg), '\n')
+	if _, err := w.Write(body); err != nil {
+		// The client went away; there is nothing useful to do.
+		return
+	}
 }

@@ -24,6 +24,10 @@ type rpcSummary struct {
 	// that discrepancy instead of failing open.
 	ToolCalls int
 
+	// ToolsListIDs lists the raw ids of tools/list requests, for
+	// matching their responses on the way back.
+	ToolsListIDs []string
+
 	// Batch reports whether the payload was a JSON-RPC batch array.
 	Batch bool
 
@@ -77,8 +81,12 @@ func addProbe(s *rpcSummary, p rpcProbe) {
 	if p.Method != "" {
 		s.Methods = append(s.Methods, p.Method)
 	}
-	if len(p.ID) > 0 && string(p.ID) != "null" {
+	hasID := len(p.ID) > 0 && string(p.ID) != "null"
+	if hasID {
 		s.IDs = append(s.IDs, string(p.ID))
+	}
+	if p.Method == "tools/list" && hasID {
+		s.ToolsListIDs = append(s.ToolsListIDs, string(p.ID))
 	}
 	if p.Method == "tools/call" {
 		s.ToolCalls++

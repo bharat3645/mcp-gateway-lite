@@ -18,9 +18,6 @@ import (
 	"github.com/bharat3645/mcp-gateway-lite/gateway"
 )
 
-// version is reported by --version.
-const version = "0.3.0"
-
 // upstreamFlags collects repeatable --upstream name=url flags.
 type upstreamFlags []gateway.Upstream
 
@@ -61,7 +58,7 @@ func run(args []string, stdout io.Writer) error {
 	}
 
 	if *showVersion {
-		fmt.Fprintln(stdout, "mcp-gateway-lite", version)
+		fmt.Fprintln(stdout, "mcp-gateway-lite", gateway.Version)
 		return nil
 	}
 
@@ -110,7 +107,7 @@ func run(args []string, stdout io.Writer) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		fmt.Fprintf(os.Stderr, "mcp-gateway-lite %s listening on %s (%d upstreams)\n", version, cfg.Listen, len(cfg.Upstreams))
+		fmt.Fprintf(os.Stderr, "mcp-gateway-lite %s listening on %s (%d upstreams)\n", gateway.Version, cfg.Listen, len(cfg.Upstreams))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bharat3645/mcp-gateway-lite/gateway"
 )
 
 func TestVersionFlag(t *testing.T) {
@@ -13,7 +15,7 @@ func TestVersionFlag(t *testing.T) {
 	if err := run([]string{"--version"}, &out); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), version) {
+	if !strings.Contains(out.String(), gateway.Version) {
 		t.Fatalf("version output = %q", out.String())
 	}
 }

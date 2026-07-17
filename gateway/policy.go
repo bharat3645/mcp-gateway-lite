@@ -61,3 +61,16 @@ func (p *toolPolicy) blockReason(sum rpcSummary) string {
 	}
 	return ""
 }
+
+// allows reports whether the policy lets clients see and call the
+// named tool. A nil policy allows everything. Used when filtering
+// tools/list responses.
+func (p *toolPolicy) allows(name string) bool {
+	if p == nil {
+		return true
+	}
+	if p.allow != nil {
+		return p.allow[name]
+	}
+	return !p.deny[name]
+}
