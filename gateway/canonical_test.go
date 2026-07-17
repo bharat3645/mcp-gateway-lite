@@ -10,6 +10,8 @@ import (
 // lockfile code (mcp_sentinel/lockfile.py: _canonical, _sha256,
 // tools_hash, entry_hash), so the Go canonicalizer is pinned to
 // Python's actual behavior rather than to a mental model of it.
+// Vector strings use interpreted (double-quoted) literals so the
+// escape sequences under test are visible as escapes in the source.
 
 func TestCanonicalMatchesPythonVectors(t *testing.T) {
 	cases := []struct {
@@ -20,32 +22,32 @@ func TestCanonicalMatchesPythonVectors(t *testing.T) {
 	}{
 		{
 			"simple tool fingerprint",
-			`{"name": "read_file", "description": "Read a file from disk", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}`,
-			`{"description":"Read a file from disk","inputSchema":{"properties":{"path":{"type":"string"}},"required":["path"],"type":"object"},"name":"read_file"}`,
+			"{\"name\": \"read_file\", \"description\": \"Read a file from disk\", \"inputSchema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}, \"required\": [\"path\"]}}",
+			"{\"description\":\"Read a file from disk\",\"inputSchema\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"name\":\"read_file\"}",
 			"sha256:ec3d9d36dff46ea919f752177ca15373a1eb5f72793f13b2565b5de40872676c",
 		},
 		{
 			"unicode escapes",
-			`{"name": "café", "description": "Zoëké 🔧 tool 𝄞 漢字", "inputSchema": {}}`,
-			`{"description":"Zoëké 🔧 tool 𝄞 漢字","inputSchema":{},"name":"café"}`,
+			"{\"name\": \"caf\\u00e9\", \"description\": \"Zo\\u00ebk\\u00e9 \\ud83d\\udd27 tool \\ud834\\udd1e \\u6f22\\u5b57\", \"inputSchema\": {}}",
+			"{\"description\":\"Zo\\u00ebk\\u00e9 \\ud83d\\udd27 tool \\ud834\\udd1e \\u6f22\\u5b57\",\"inputSchema\":{},\"name\":\"caf\\u00e9\"}",
 			"sha256:a43e1f8e875a6666f5f7a6180232bbf2bb8183dbdc8d3ea8c0cc5bf0ba4498b8",
 		},
 		{
 			"control chars",
-			`{"name": "x", "description": "line1\nline2\ttab\rcr\bbs\fff\"quote\\backslashunitdel", "inputSchema": {}}`,
-			`{"description":"line1\nline2\ttab\rcr\bbs\fff\"quote\\backslashunitdel","inputSchema":{},"name":"x"}`,
+			"{\"name\": \"x\", \"description\": \"line1\\nline2\\ttab\\rcr\\bbs\\fff\\\"quote\\\\backslash\\u001funit\\u007fdel\", \"inputSchema\": {}}",
+			"{\"description\":\"line1\\nline2\\ttab\\rcr\\bbs\\fff\\\"quote\\\\backslash\\u001funit\\u007fdel\",\"inputSchema\":{},\"name\":\"x\"}",
 			"sha256:d823b7265ffe7ea9c5ed2ec5e88997771aff787bc4095f3905a69d5d99d061da",
 		},
 		{
 			"numbers",
-			`{"name": "n", "description": "", "inputSchema": {"minimum": 0, "maximum": 100, "big": 12345678901234567890, "neg": -7, "half": 0.5, "onepointfive": 1.5}}`,
-			`{"description":"","inputSchema":{"big":12345678901234567890,"half":0.5,"maximum":100,"minimum":0,"neg":-7,"onepointfive":1.5},"name":"n"}`,
+			"{\"name\": \"n\", \"description\": \"\", \"inputSchema\": {\"minimum\": 0, \"maximum\": 100, \"big\": 12345678901234567890, \"neg\": -7, \"half\": 0.5, \"onepointfive\": 1.5}}",
+			"{\"description\":\"\",\"inputSchema\":{\"big\":12345678901234567890,\"half\":0.5,\"maximum\":100,\"minimum\":0,\"neg\":-7,\"onepointfive\":1.5},\"name\":\"n\"}",
 			"sha256:ba092be26f6b7faac3d2e723eae7a449cca20e1eda4fa5a153f287f619a868b6",
 		},
 		{
 			"nested",
-			`{"name": "z", "description": "", "inputSchema": {"a": [1, {"b": [true, false, null, []], "a": {}}, "s"], "empty": {}}}`,
-			`{"description":"","inputSchema":{"a":[1,{"a":{},"b":[true,false,null,[]]},"s"],"empty":{}},"name":"z"}`,
+			"{\"name\": \"z\", \"description\": \"\", \"inputSchema\": {\"a\": [1, {\"b\": [true, false, null, []], \"a\": {}}, \"s\"], \"empty\": {}}}",
+			"{\"description\":\"\",\"inputSchema\":{\"a\":[1,{\"a\":{},\"b\":[true,false,null,[]]},\"s\"],\"empty\":{}},\"name\":\"z\"}",
 			"sha256:1be242abffa2559d062dbcba0507d976ddd703f73d04699800fa098da3d8d968",
 		},
 	}
