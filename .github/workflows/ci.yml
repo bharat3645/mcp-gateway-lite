@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -d .; exit 1)
+      - name: go vet
+        run: go vet ./...
+      - name: go test (race)
+        run: go test -race -count=1 ./...
+      - name: go build
+        run: go build ./...
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: build binary
+        run: go build -o /tmp/mcp-gateway-lite ./cmd/mcp-gateway-lite
+      - name: end-to-end smoke
+        run: |
+          set -euo pipefail
+          /tmp/mcp-gateway-lite --version
+          /tmp/mcp-gateway-lite --check --config example.config.json
+          python3 ci/upstream_stub.py 127.0.0.1 3901 &
+          STUB=$!
+          /tmp/mcp-gateway-lite --listen 127.0.0.1:8385 --upstream files=http://127.0.0.1:3901/mcp --audit /tmp/audit.jsonl &
+          GW=$!
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:8385/healthz > /dev/null; then break; fi
+            if [ "$i" = 20 ]; then echo 'gateway never came up'; exit 1; fi
+            sleep 0.5
+          done
+          for i in $(seq 1 20); do
+            if curl -s -o /dev/null http://127.0.0.1:3901/; then break; fi
+            if [ "$i" = 20 ]; then echo 'stub never came up'; exit 1; fi
+            sleep 0.5
+          done
+          RESP=$(curl -sf -X POST http://127.0.0.1:8385/mcp/files \
+            -H 'Content-Type: application/json' \
+            -H 'Mcp-Session-Id: smoke-1' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}')
+          echo "$RESP"
+          echo "$RESP" | grep -qF '"jsonrpc"'
+          curl -sf -X POST http://127.0.0.1:8385/mcp/files \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/etc/hosts"}}}' \
+            > /dev/null
+          if curl -sf -X POST http://127.0.0.1:8385/mcp/nope -d '{}' > /dev/null; then
+            echo 'expected 404 for unknown upstream'
+            exit 1
+          fi
+          kill $GW $STUB
+          wait $GW $STUB || true
+          echo '--- audit log ---'
+          cat /tmp/audit.jsonl
+          grep -qF '"rpc_methods":["initialize"]' /tmp/audit.jsonl
+          grep -qF '"tools":["read_file"]' /tmp/audit.jsonl
+          grep -qF '"session_id":"smoke-1"' /tmp/audit.jsonl
+          grep -qF 'unknown upstream' /tmp/audit.jsonl
+          if grep -qF '/etc/hosts' /tmp/audit.jsonl; then
+            echo 'FAIL: tool arguments leaked into audit log'
+            exit 1
+          fi
