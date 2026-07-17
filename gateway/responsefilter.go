@@ -26,15 +26,23 @@ type rewriteState struct {
 	// no filtering.
 	policy *toolPolicy
 
+	// lock is the upstream's prepared tools_lock; tools/list results
+	// are verified against it before any filtering. nil means no
+	// verification.
+	lock *preparedLock
+
 	// strict selects fail-closed handling for responses the gateway
-	// cannot process (allowlist semantics: an allowlist that fails
-	// open is theater). Deny-list-only upstreams run lax: what cannot
-	// be processed passes through, because a blocklist is best-effort
-	// by nature.
+	// cannot process (allowlist or enforce-lock semantics: a check
+	// that fails open is theater). Otherwise the state runs lax: what
+	// cannot be processed passes through, because a deny list (or a
+	// warn-mode lock) is best-effort by nature.
 	strict bool
 
 	// filtered counts tools removed from tools/list results.
 	filtered int
+
+	// drift reports that lock verification failed at least once.
+	drift bool
 
 	// note records the first noteworthy processing outcome for the
 	// audit entry.
@@ -49,8 +57,15 @@ func (st *rewriteState) noteOnce(reason string) {
 }
 
 // strictCode is the JSON-RPC error code used when strict processing
-// replaces a response: -32003, the tool-policy code.
+// replaces a response: -32003 when the strictness comes from an
+// allowlist policy, -32004 when it comes from an enforce-mode lock.
 func (st *rewriteState) strictCode() int {
+	if st.policy != nil && st.policy.allow != nil {
+		return -32003
+	}
+	if st.lock != nil && st.lock.enforce {
+		return -32004
+	}
 	return -32003
 }
 
@@ -117,9 +132,9 @@ type rpcResponseProbe struct {
 
 // examineMessage inspects one JSON-RPC response message.
 // Non-candidate messages (other ids, error responses) pass. For a
-// candidate tools/list result it applies the tool policy, dropping
-// blocked tools; kept tools and sibling result fields are emitted
-// with their original bytes.
+// candidate tools/list result it verifies the lock, then applies the
+// tool policy, dropping blocked tools; kept tools and sibling result
+// fields are emitted with their original bytes.
 func (st *rewriteState) examineMessage(m json.RawMessage) msgOutcome {
 	var probe rpcResponseProbe
 	if err := json.Unmarshal(m, &probe); err != nil {
@@ -156,6 +171,18 @@ func (st *rewriteState) examineMessage(m json.RawMessage) msgOutcome {
 			return block("tools/list result tools is not an array")
 		}
 		return msgOutcome{verdict: msgPass}
+	}
+	// Lock verification runs before policy filtering, against the
+	// tools exactly as the server sent them — the lock pins server
+	// truth; the filter shapes the client's view.
+	if st.lock != nil {
+		if reason := st.lock.verify(elems); reason != "" {
+			st.drift = true
+			st.noteOnce(reason)
+			if st.lock.enforce {
+				return msgOutcome{verdict: msgBlock, id: probe.ID, code: -32004, reason: reason}
+			}
+		}
 	}
 	kept := make([]json.RawMessage, 0, len(elems))
 	removed := 0

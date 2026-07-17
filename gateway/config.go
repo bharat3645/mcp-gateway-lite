@@ -19,8 +19,7 @@ const DefaultListen = "127.0.0.1:8385"
 // segments and audit-log values.
 var nameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
-// RateLimitConfig is a per-upstream token-bucket limit. The bucket is
-// gateway-wide for the upstream, not per client.
+// RateLimitConfig is a per-upstream token-bucket limit.
 type RateLimitConfig struct {
 	// RequestsPerSecond is the sustained refill rate. Must be > 0.
 	RequestsPerSecond float64 `json:"requests_per_second"`
@@ -28,6 +27,32 @@ type RateLimitConfig struct {
 	// Burst is the bucket capacity — the number of requests served
 	// back-to-back before the sustained rate applies. Must be >= 1.
 	Burst int `json:"burst"`
+
+	// PerSession keys buckets by Mcp-Session-Id instead of one
+	// gateway-wide bucket for the upstream. Session ids are
+	// client-supplied, so this is fairness between honest clients,
+	// not DoS protection; the bucket table is bounded with
+	// least-recently-seen eviction.
+	PerSession bool `json:"per_session,omitempty"`
+}
+
+// LockConfig wires an mcp-sentinel-format lockfile into the request
+// path for one upstream: tools/list responses are verified against
+// the locked tool fingerprints, and drift is blocked (enforce) or
+// audited (warn).
+type LockConfig struct {
+	// File is the lockfile path. Required. Generate it with
+	// --lock-init, or with `mcp-sentinel lock` from a tools capture.
+	File string `json:"file"`
+
+	// Server selects the lockfile server entry; defaults to the
+	// upstream name.
+	Server string `json:"server,omitempty"`
+
+	// Mode is "enforce" (default: drifted tools/list responses are
+	// replaced with a JSON-RPC -32004 error) or "warn" (drift passes
+	// but is audited).
+	Mode string `json:"mode,omitempty"`
 }
 
 // Upstream describes one MCP server behind the gateway.
@@ -54,13 +79,18 @@ type Upstream struct {
 	// ToolsAllow, when non-empty, is an exhaustive allowlist for
 	// tools/call: any other tool is blocked with 403, and unparseable
 	// bodies are blocked too, because default-deny needs verifiable
-	// input. Mutually exclusive with ToolsDeny.
+	// input. tools/list responses are filtered to match. Mutually
+	// exclusive with ToolsDeny.
 	ToolsAllow []string `json:"tools_allow,omitempty"`
 
-	// ToolsDeny blocks matching tools/call names with 403.
-	// Unparseable bodies pass through — a blocklist is best-effort by
-	// nature.
+	// ToolsDeny blocks matching tools/call names with 403 and filters
+	// them out of tools/list responses. Unparseable bodies pass
+	// through — a blocklist is best-effort by nature.
 	ToolsDeny []string `json:"tools_deny,omitempty"`
+
+	// ToolsLock, when set, verifies tools/list responses against a
+	// sentinel-format lockfile (the rug-pull check, inline).
+	ToolsLock *LockConfig `json:"tools_lock,omitempty"`
 
 	// AuthorizationServers is advertised in the generated RFC 9728
 	// protected-resource metadata for this upstream.
@@ -120,7 +150,9 @@ func Load(path string) (Config, error) {
 
 // Validate checks the configuration and fills in defaults. It is
 // called by Load and by New, so hand-built configs get the same
-// treatment as loaded ones.
+// treatment as loaded ones. It never touches the filesystem;
+// lockfiles referenced by tools_lock are read when the gateway is
+// built (or by LockInit).
 func (c *Config) Validate() error {
 	if c.Listen == "" {
 		c.Listen = DefaultListen
@@ -168,6 +200,16 @@ func (c *Config) Validate() error {
 		for _, tool := range u.ToolsDeny {
 			if strings.TrimSpace(tool) == "" {
 				return fmt.Errorf("upstream %q: tools_deny entries must not be empty", u.Name)
+			}
+		}
+		if u.ToolsLock != nil {
+			if strings.TrimSpace(u.ToolsLock.File) == "" {
+				return fmt.Errorf("upstream %q: tools_lock.file is required", u.Name)
+			}
+			switch u.ToolsLock.Mode {
+			case "", "enforce", "warn":
+			default:
+				return fmt.Errorf("upstream %q: tools_lock.mode must be \"enforce\" or \"warn\", got %q", u.Name, u.ToolsLock.Mode)
 			}
 		}
 		for _, as := range u.AuthorizationServers {

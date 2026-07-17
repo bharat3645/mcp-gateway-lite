@@ -54,6 +54,12 @@ type Entry struct {
 	// tools/list response by the upstream's tool policy.
 	ToolsFiltered int `json:"tools_filtered,omitempty"`
 
+	// ToolsDrift reports that tools_lock verification failed for this
+	// request's tools/list response. Error carries the detail; in
+	// enforce mode the response was replaced with a JSON-RPC -32004
+	// error, in warn mode it passed through.
+	ToolsDrift bool `json:"tools_drift,omitempty"`
+
 	// Status is the HTTP status returned to the client.
 	Status int `json:"status"`
 

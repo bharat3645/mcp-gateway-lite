@@ -68,13 +68,19 @@ type Gateway struct {
 	// .well-known metadata generation.
 	upstreams map[string]Upstream
 
-	// limits maps upstream name to its token bucket; a missing entry
-	// means unlimited.
+	// limits maps upstream name to its gateway-wide token bucket; a
+	// missing entry means unlimited (or per-session limiting).
 	limits map[string]*tokenBucket
+
+	// sessionLimits maps upstream name to its per-session limiter.
+	sessionLimits map[string]*sessionLimiter
 
 	// policies maps upstream name to its tool policy; nil means no
 	// policy.
 	policies map[string]*toolPolicy
+
+	// locks maps upstream name to its prepared tools_lock.
+	locks map[string]*preparedLock
 }
 
 // New validates cfg and builds a Gateway. The auditor must not be
@@ -91,7 +97,10 @@ func New(cfg Config, auditor *Auditor) (*Gateway, error) {
 	g.routes = make(map[string]*httputil.ReverseProxy, len(cfg.Upstreams))
 	g.upstreams = make(map[string]Upstream, len(cfg.Upstreams))
 	g.limits = make(map[string]*tokenBucket)
+	g.sessionLimits = make(map[string]*sessionLimiter)
 	g.policies = make(map[string]*toolPolicy)
+	g.locks = make(map[string]*preparedLock)
+	lockCache := make(map[string]*lockFile)
 	for _, u := range cfg.Upstreams {
 		p, err := newProxy(u)
 		if err != nil {
@@ -100,10 +109,21 @@ func New(cfg Config, auditor *Auditor) (*Gateway, error) {
 		g.routes[u.Name] = p
 		g.upstreams[u.Name] = u
 		if u.RateLimit != nil {
-			g.limits[u.Name] = newTokenBucket(u.RateLimit.RequestsPerSecond, u.RateLimit.Burst, nil)
+			if u.RateLimit.PerSession {
+				g.sessionLimits[u.Name] = newSessionLimiter(u.RateLimit.RequestsPerSecond, u.RateLimit.Burst, maxSessionBuckets, nil)
+			} else {
+				g.limits[u.Name] = newTokenBucket(u.RateLimit.RequestsPerSecond, u.RateLimit.Burst, nil)
+			}
 		}
 		if pol := newToolPolicy(u); pol != nil {
 			g.policies[u.Name] = pol
+		}
+		if u.ToolsLock != nil {
+			pl, err := prepareLock(u, lockCache)
+			if err != nil {
+				return nil, fmt.Errorf("gateway: upstream %q: %w", u.Name, err)
+			}
+			g.locks[u.Name] = pl
 		}
 	}
 	return g, nil
@@ -147,27 +167,31 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Rate limiting happens before the body is read: a limited client
 	// must not consume gateway bandwidth. The tradeoff is that 429
 	// audit entries carry no rpc_* fields.
-	if b := g.limits[name]; b != nil {
-		if allowed, retry := b.allow(); !allowed {
-			secs := int(math.Ceil(retry.Seconds()))
-			if secs < 1 {
-				secs = 1
-			}
-			w.Header().Set("Retry-After", strconv.Itoa(secs))
-			var e Entry
-			e.Time = now()
-			e.Upstream = name
-			e.Remote = r.RemoteAddr
-			e.HTTPMethod = r.Method
-			e.Path = r.URL.Path
-			e.SessionID = r.Header.Get("Mcp-Session-Id")
-			e.ProtocolVersion = r.Header.Get("MCP-Protocol-Version")
-			e.Status = http.StatusTooManyRequests
-			e.Error = "rate limited"
-			g.auditor.Log(e)
-			writeJSONError(w, http.StatusTooManyRequests, -32002, "rate limited")
-			return
+	allowed, retry := true, time.Duration(0)
+	if sl := g.sessionLimits[name]; sl != nil {
+		allowed, retry = sl.allow(r.Header.Get("Mcp-Session-Id"))
+	} else if b := g.limits[name]; b != nil {
+		allowed, retry = b.allow()
+	}
+	if !allowed {
+		secs := int(math.Ceil(retry.Seconds()))
+		if secs < 1 {
+			secs = 1
 		}
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		var e Entry
+		e.Time = now()
+		e.Upstream = name
+		e.Remote = r.RemoteAddr
+		e.HTTPMethod = r.Method
+		e.Path = r.URL.Path
+		e.SessionID = r.Header.Get("Mcp-Session-Id")
+		e.ProtocolVersion = r.Header.Get("MCP-Protocol-Version")
+		e.Status = http.StatusTooManyRequests
+		e.Error = "rate limited"
+		g.auditor.Log(e)
+		writeJSONError(w, http.StatusTooManyRequests, -32002, "rate limited")
+		return
 	}
 
 	start := time.Now()
@@ -222,11 +246,14 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// If the request carries tools/list and this upstream has a tool
-	// policy, the response needs filtering on the way back so clients
-	// never see tools they cannot call.
+	// policy or a tools_lock, the response needs processing on the
+	// way back: verification against the lock, then filtering so
+	// clients never see tools they cannot call.
 	var rw *rewriteState
-	if pol := g.policies[name]; pol != nil && len(sum.ToolsListIDs) > 0 {
-		rw = &rewriteState{ids: sum.ToolsListIDs, policy: pol, strict: pol.allow != nil}
+	pol, lk := g.policies[name], g.locks[name]
+	if (pol != nil || lk != nil) && len(sum.ToolsListIDs) > 0 {
+		strict := (pol != nil && pol.allow != nil) || (lk != nil && lk.enforce)
+		rw = &rewriteState{ids: sum.ToolsListIDs, policy: pol, lock: lk, strict: strict}
 	}
 
 	rec := &countingWriter{ResponseWriter: w}
@@ -255,6 +282,7 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if rw != nil {
 		e.ToolsFiltered = rw.filtered
+		e.ToolsDrift = rw.drift
 		if rw.note != "" && e.Error == "" {
 			e.Error = rw.note
 		}

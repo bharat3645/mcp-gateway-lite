@@ -48,6 +48,8 @@ func run(args []string, stdout io.Writer) error {
 	auditPath := fs.String("audit", "", "audit JSONL destination (overrides config; default stdout)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	checkOnly := fs.Bool("check", false, "validate configuration and exit")
+	lockInit := fs.Bool("lock-init", false, "fetch tools/list from every upstream, write/merge a sentinel-format lockfile, and exit")
+	lockFilePath := fs.String("lock-file", "mcp-sentinel.lock", "lockfile path for --lock-init")
 	var ups upstreamFlags
 	fs.Var(&ups, "upstream", "upstream as name=url (repeatable, adds to config upstreams)")
 	if err := fs.Parse(args); err != nil {
@@ -79,6 +81,10 @@ func run(args []string, stdout io.Writer) error {
 	}
 	if err := cfg.Validate(); err != nil {
 		return err
+	}
+
+	if *lockInit {
+		return gateway.LockInit(cfg, *lockFilePath, stdout)
 	}
 
 	if *checkOnly {

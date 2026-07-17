@@ -147,3 +147,97 @@ func TestNoRateLimitByDefault(t *testing.T) {
 	}
 	waitForEntries(t, buf, 10)
 }
+
+func TestSessionLimiterIsolatesSessions(t *testing.T) {
+	cur := time.Unix(0, 0)
+	l := newSessionLimiter(1, 2, 8, func() time.Time { return cur })
+	for i := 0; i < 2; i++ {
+		if ok, _ := l.allow("a"); !ok {
+			t.Fatalf("a burst %d must pass", i)
+		}
+	}
+	if ok, _ := l.allow("a"); ok {
+		t.Fatal("a should be exhausted")
+	}
+	if ok, _ := l.allow("b"); !ok {
+		t.Fatal("b must not share a's bucket")
+	}
+	if ok, _ := l.allow(""); !ok {
+		t.Fatal("the empty session gets its own shared bucket")
+	}
+}
+
+func TestSessionLimiterEviction(t *testing.T) {
+	cur := time.Unix(0, 0)
+	l := newSessionLimiter(1, 1, 2, func() time.Time { return cur })
+	if ok, _ := l.allow("a"); !ok {
+		t.Fatal("a")
+	}
+	cur = cur.Add(time.Millisecond)
+	if ok, _ := l.allow("b"); !ok {
+		t.Fatal("b")
+	}
+	cur = cur.Add(time.Millisecond)
+	// c evicts a (least recently seen); a's return then gets a fresh
+	// bucket — the documented consequence of bounding a table keyed
+	// by untrusted ids.
+	if ok, _ := l.allow("c"); !ok {
+		t.Fatal("c")
+	}
+	if len(l.buckets) != 2 {
+		t.Fatalf("buckets = %d, want 2 (bounded)", len(l.buckets))
+	}
+	cur = cur.Add(time.Millisecond)
+	if ok, _ := l.allow("a"); !ok {
+		t.Fatal("evicted session must get a fresh bucket")
+	}
+}
+
+func TestPerSessionRateLimitEndToEnd(t *testing.T) {
+	upstream := echoUpstream(t)
+	buf := &syncBuffer{}
+	u := Upstream{Name: "files", URL: upstream.URL}
+	u.RateLimit = &RateLimitConfig{RequestsPerSecond: 0.001, Burst: 1, PerSession: true}
+	gw, err := New(Config{Upstreams: []Upstream{u}}, NewAuditorWriter(buf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(gw)
+	t.Cleanup(srv.Close)
+
+	do := func(session string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/mcp/files", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if session != "" {
+			req.Header.Set("Mcp-Session-Id", session)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := do("s1"); got != http.StatusOK {
+		t.Fatalf("s1 first = %d", got)
+	}
+	if got := do("s1"); got != http.StatusTooManyRequests {
+		t.Fatalf("s1 second = %d, want 429", got)
+	}
+	if got := do("s2"); got != http.StatusOK {
+		t.Fatalf("s2 first = %d (sessions must not share buckets)", got)
+	}
+	if got := do(""); got != http.StatusOK {
+		t.Fatalf("no-session first = %d", got)
+	}
+	if got := do(""); got != http.StatusTooManyRequests {
+		t.Fatalf("no-session second = %d, want 429", got)
+	}
+	waitForEntries(t, buf, 5)
+	if !strings.Contains(buf.String(), `"session_id":"s1"`) {
+		t.Error("429 audit lost the session id")
+	}
+}
