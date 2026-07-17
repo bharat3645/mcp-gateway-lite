@@ -15,10 +15,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -46,11 +48,19 @@ type Gateway struct {
 	// cfg is the validated configuration the gateway was built with.
 	cfg Config
 
-	// auditor receives one Entry per handled request.
+	// auditor receives one Entry per handled /mcp request.
 	auditor *Auditor
 
 	// routes maps upstream name to its reverse proxy.
 	routes map[string]*httputil.ReverseProxy
+
+	// upstreams maps upstream name to its validated config, used for
+	// .well-known metadata generation.
+	upstreams map[string]Upstream
+
+	// limits maps upstream name to its token bucket; a missing entry
+	// means unlimited.
+	limits map[string]*tokenBucket
 }
 
 // New validates cfg and builds a Gateway. The auditor must not be
@@ -63,13 +73,20 @@ func New(cfg Config, auditor *Auditor) (*Gateway, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	g := &Gateway{cfg: cfg, auditor: auditor, routes: make(map[string]*httputil.ReverseProxy, len(cfg.Upstreams))}
+	g := &Gateway{cfg: cfg, auditor: auditor}
+	g.routes = make(map[string]*httputil.ReverseProxy, len(cfg.Upstreams))
+	g.upstreams = make(map[string]Upstream, len(cfg.Upstreams))
+	g.limits = make(map[string]*tokenBucket)
 	for _, u := range cfg.Upstreams {
 		p, err := newProxy(u)
 		if err != nil {
 			return nil, fmt.Errorf("gateway: upstream %q: %w", u.Name, err)
 		}
 		g.routes[u.Name] = p
+		g.upstreams[u.Name] = u
+		if u.RateLimit != nil {
+			g.limits[u.Name] = newTokenBucket(u.RateLimit.RequestsPerSecond, u.RateLimit.Burst, nil)
+		}
 	}
 	return g, nil
 }
@@ -79,10 +96,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/healthz":
 		g.handleHealth(w)
+	case strings.HasPrefix(r.URL.Path, wellKnownPrefix):
+		g.handleWellKnown(w, r)
 	case strings.HasPrefix(r.URL.Path, "/mcp/"):
 		g.handleProxy(w, r)
 	default:
-		writeJSONError(w, http.StatusNotFound, "not found")
+		writeJSONError(w, http.StatusNotFound, -32001, "not found")
 	}
 }
 
@@ -103,8 +122,34 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 		e.Status = http.StatusNotFound
 		e.Error = "unknown upstream"
 		g.auditor.Log(e)
-		writeJSONError(w, http.StatusNotFound, "unknown upstream")
+		writeJSONError(w, http.StatusNotFound, -32001, "unknown upstream")
 		return
+	}
+
+	// Rate limiting happens before the body is read: a limited client
+	// must not consume gateway bandwidth. The tradeoff is that 429
+	// audit entries carry no rpc_* fields.
+	if b := g.limits[name]; b != nil {
+		if allowed, retry := b.allow(); !allowed {
+			secs := int(math.Ceil(retry.Seconds()))
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			var e Entry
+			e.Time = now()
+			e.Upstream = name
+			e.Remote = r.RemoteAddr
+			e.HTTPMethod = r.Method
+			e.Path = r.URL.Path
+			e.SessionID = r.Header.Get("Mcp-Session-Id")
+			e.ProtocolVersion = r.Header.Get("MCP-Protocol-Version")
+			e.Status = http.StatusTooManyRequests
+			e.Error = "rate limited"
+			g.auditor.Log(e)
+			writeJSONError(w, http.StatusTooManyRequests, -32002, "rate limited")
+			return
+		}
 	}
 
 	start := time.Now()
@@ -293,8 +338,8 @@ type readCloser struct {
 	io.Closer
 }
 
-func writeJSONError(w http.ResponseWriter, status int, msg string) {
+func writeJSONError(w http.ResponseWriter, status, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	fmt.Fprintf(w, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32001,\"message\":%q}}\n", msg)
+	fmt.Fprintf(w, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":%d,\"message\":%q}}\n", code, msg)
 }
