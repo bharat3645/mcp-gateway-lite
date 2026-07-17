@@ -3,6 +3,28 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-07-17
+
+M3a: tool policies.
+
+### Added
+
+- Per-upstream `tools_allow` / `tools_deny` (mutually exclusive)
+  enforced on `tools/call` at the gateway: 403 + JSON-RPC `-32003`
+  naming the blocked tool, full audit entry with rpc metadata
+  preserved. Batch semantics: one blocked tool rejects the whole
+  request. Non-tool traffic is never affected.
+- Deliberate failure modes: allowlists are default-deny (unparseable
+  bodies and nameless `tools/call` blocked); deny lists are
+  best-effort (unparseable bodies pass). Documented, tested.
+- `rpcSummary.ToolCalls` counter so allowlist mode detects
+  name-extraction gaps instead of failing open.
+
+### Changed
+
+- JSON-RPC error codes: `-32003` for policy blocks (alongside
+  `-32001` routing, `-32002` rate limiting).
+
 ## [0.2.0] - 2026-07-17
 
 M2: backpressure + discovery.

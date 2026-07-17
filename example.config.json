@@ -11,6 +11,7 @@
         "requests_per_second": 10,
         "burst": 20
       },
+      "tools_deny": ["delete_file"],
       "resource_name": "Files MCP"
     },
     {

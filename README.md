@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/bharat3645/mcp-gateway-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/bharat3645/mcp-gateway-lite/actions/workflows/ci.yml)
 
-Single-binary, stateless reverse proxy for [MCP](https://modelcontextprotocol.io) Streamable HTTP servers, with a JSON Lines audit trail, per-upstream rate limits, and generated RFC 9728 `.well-known` metadata.
+Single-binary, stateless reverse proxy for [MCP](https://modelcontextprotocol.io) Streamable HTTP servers, with a JSON Lines audit trail, per-upstream rate limits, per-tool allow/deny policies, and generated RFC 9728 `.well-known` metadata.
 
 Stdlib-only Go. No frameworks, no dependencies, one process in front of your MCP servers that answers the question enterprises keep asking: **"which agent called which tool, when?"**
 
@@ -19,8 +19,9 @@ MCP adoption ran ahead of MCP operations. Most deployments today wire agents str
 - **Audit every request** — JSON-RPC method, tools/call tool name, session id, status, timing — as append-only JSONL you can ship to any log pipeline.
 - **One URL for many servers** — path-based routing (`/mcp/<name>`) turns N server endpoints into one gateway endpoint.
 - **Backpressure** — per-upstream token-bucket rate limits with `429` + `Retry-After`, audited so throttled sessions stay attributable.
+- **Containment** — per-tool allow/deny lists: block `delete_file` at the gateway even if the upstream serves it, or run an upstream default-deny with an explicit allowlist.
 - **`.well-known` for servers that lack it** — generated [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) protected-resource metadata per upstream.
-- **A place for policy** — the roadmap wires [agent-rules-audit](https://github.com/bharat3645/agent-rules-audit) and [mcp-sentinel](https://github.com/bharat3645/mcp-sentinel)-style checks into the request path.
+- **Next: deeper policy hooks** — the roadmap wires [mcp-sentinel](https://github.com/bharat3645/mcp-sentinel)-style tool-schema drift verification into the request path.
 
 ## Privacy by construction
 
@@ -64,6 +65,7 @@ Each request produces one audit line:
       "name": "files",
       "url": "http://127.0.0.1:3001/mcp",
       "rate_limit": { "requests_per_second": 10, "burst": 20 },
+      "tools_deny": ["delete_file"],
       "authorization_servers": ["https://auth.example.com"],
       "resource_name": "Files MCP"
     },
@@ -82,6 +84,8 @@ Each request produces one audit line:
 | `upstreams[].header_timeout_seconds` | Max wait for upstream response *headers*. Bodies are unbounded so SSE streams stay open | 30 |
 | `upstreams[].rate_limit.requests_per_second` | Sustained token-bucket refill rate (gateway-wide for the upstream) | unlimited |
 | `upstreams[].rate_limit.burst` | Bucket capacity — requests served back-to-back before the sustained rate applies | — |
+| `upstreams[].tools_allow` | Exhaustive `tools/call` allowlist (default-deny). Mutually exclusive with `tools_deny` | no policy |
+| `upstreams[].tools_deny` | `tools/call` blocklist (best-effort) | no policy |
 | `upstreams[].authorization_servers` | Advertised in generated RFC 9728 metadata | none |
 | `upstreams[].resource_name` | Human-readable name in generated metadata | none |
 
@@ -101,12 +105,23 @@ Unknown config fields are rejected — a typo fails loudly instead of silently d
 | `rpc_ids` | Raw JSON-RPC ids (string ids keep quoting; notifications contribute none) |
 | `tools` | `params.name` for each `tools/call` — the only params field ever extracted |
 | `rpc_batch` | Body was a JSON-RPC batch array |
-| `rpc_invalid` | Body wasn't parseable JSON (or exceeded the 1 MiB metadata cap). Request is proxied regardless |
+| `rpc_invalid` | Body wasn't parseable JSON (or exceeded the 1 MiB metadata cap). Request is proxied regardless (unless an allowlist policy applies) |
 | `status` | HTTP status returned to the client |
 | `sse` | Response was `text/event-stream` |
 | `bytes_in`, `bytes_out` | Body sizes (accurate even past the metadata cap) |
 | `duration_ms` | Wall-clock duration |
-| `error` | Proxy-level failure (unreachable upstream, unknown route, `rate limited`) |
+| `error` | Proxy-level failure or policy verdict (`unknown upstream`, `rate limited`, `tool blocked by policy: <name>`, transport errors) |
+
+## Tool policies
+
+Per-upstream `tools_allow` / `tools_deny` (mutually exclusive) are enforced on `tools/call` at the gateway, riding the same body peek the audit log uses. Blocked requests return `403` + JSON-RPC `-32003` naming the tool, and produce a **full audit entry** with the rpc metadata — blocked calls are the entries operators care about most. Batch semantics: one blocked tool rejects the whole request. Non-tool traffic (`initialize`, `tools/list`, notifications, responses) is never affected.
+
+The two modes fail differently, on purpose:
+
+- **`tools_allow` is default-deny:** unparseable bodies and `tools/call` messages without an extractable tool name are blocked — an allowlist that fails open is theater.
+- **`tools_deny` is best-effort:** unparseable bodies pass through; it is a guardrail, not a boundary.
+
+Honest limitation: policies block *calls*; they don't filter denied tools out of `tools/list` responses (that needs response rewriting — roadmap). Agents will see a denied tool listed, then get `403` when calling it, with the denial audited.
 
 ## Rate limiting
 
@@ -133,7 +148,7 @@ Two deliberate choices, documented honestly:
 
 ## What's not here (yet)
 
-1. **M3 — policy hooks:** inline `mcp-sentinel verify` (tool-schema drift → block), instruction-file poisoning checks, per-tool allow/deny lists, per-session rate keys.
+1. **M3b — drift verification:** inline `mcp-sentinel`-style lockfile verify (tool-schema drift → block — the rug-pull shape), per-session rate keys, `tools/list` response filtering.
 2. **Auth:** the gateway forwards credentials and advertises metadata; it does not mint or verify tokens. Put it behind your SSO-terminating proxy.
 
 If you need multi-tenant session stickiness, load balancing, or an admin UI, you want a heavier gateway — this one is a single static binary you can read in an afternoon.
