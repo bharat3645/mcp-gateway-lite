@@ -6,7 +6,12 @@
   "upstreams": [
     {
       "name": "files",
-      "url": "http://127.0.0.1:3001/mcp"
+      "url": "http://127.0.0.1:3001/mcp",
+      "rate_limit": {
+        "requests_per_second": 10,
+        "burst": 20
+      },
+      "resource_name": "Files MCP"
     },
     {
       "name": "search",

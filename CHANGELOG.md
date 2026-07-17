@@ -3,6 +3,30 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-07-17
+
+M2: backpressure + discovery.
+
+### Added
+
+- Per-upstream token-bucket rate limiting
+  (`rate_limit.requests_per_second` + `burst`): continuous refill,
+  429 + JSON-RPC `-32002` + `Retry-After` on exhaustion, audited
+  (`status: 429`, `error: "rate limited"`, session id preserved).
+  Limited requests are rejected before the body is read so floods
+  can't consume gateway bandwidth — documented tradeoff: 429 entries
+  carry no `rpc_*` fields.
+- Generated RFC 9728 protected-resource metadata per upstream at
+  `/.well-known/oauth-protected-resource/mcp/<name>`: `resource`,
+  optional `authorization_servers` + `resource_name` from config,
+  `bearer_methods_supported: ["header"]`. New `public_base_url`
+  config for TLS-terminating deployments (request-Host fallback).
+
+### Changed
+
+- JSON-RPC error code split: `-32001` for routing errors, `-32002`
+  for rate limiting.
+
 ## [0.1.0] - 2026-07-17
 
 M1: proxy + audit core.
