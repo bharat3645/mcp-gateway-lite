@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -533,27 +534,47 @@ func TestBatchToolsListResponseFiltered(t *testing.T) {
 	}
 }
 
-func TestAcceptEncodingStrippedForCandidateRequests(t *testing.T) {
+func TestToolsListFilteredThroughUpstreamCompression(t *testing.T) {
+	// The gateway strips the client's Accept-Encoding on candidate
+	// exchanges, so its own transport negotiates compression and
+	// transparently decompresses it. The observable contract: a
+	// gzip-serving upstream still gets its tools/list filtered.
+	// Without the strip, the client-negotiated gzip body would be
+	// opaque to the rewriter and the denied tool would leak.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := []byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read_file"},{"name":"delete_file"}]}}`)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":9,"result":{"ae":%q}}`, r.Header.Get("Accept-Encoding"))
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			gz := gzip.NewWriter(w)
+			if _, err := gz.Write(body); err != nil {
+				t.Error(err)
+			}
+			gz.Close()
+			return
+		}
+		if _, err := w.Write(body); err != nil {
+			t.Error(err)
+		}
 	}))
 	t.Cleanup(upstream.Close)
 	u := Upstream{Name: "files", URL: upstream.URL}
 	u.ToolsDeny = []string{"delete_file"}
-	gw, _ := gatewayWith(t, u)
+	gw, buf := gatewayWith(t, u)
 
-	// Candidate (tools/list): Accept-Encoding must be stripped so the
-	// response is parseable.
-	_, body := postBody(t, gw.URL+"/mcp/files", toolsListReq)
-	if !strings.Contains(body, `"ae":""`) {
-		t.Errorf("candidate request kept Accept-Encoding: %s", body)
+	status, body := postBody(t, gw.URL+"/mcp/files", toolsListReq)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", status, body)
 	}
-	// Non-candidate: the client's Accept-Encoding passes through
-	// (Go's client sends gzip by default).
-	_, body = postBody(t, gw.URL+"/mcp/files", `{"jsonrpc":"2.0","id":2,"method":"ping"}`)
-	if !strings.Contains(body, "gzip") {
-		t.Errorf("non-candidate request lost Accept-Encoding: %s", body)
+	if strings.Contains(body, "delete_file") {
+		t.Fatalf("denied tool leaked through compressed upstream: %q", body)
+	}
+	if !strings.Contains(body, "read_file") {
+		t.Fatalf("filtered response unreadable: %q", body)
+	}
+	entries := waitForEntries(t, buf, 1)
+	if entries[0].ToolsFiltered != 1 {
+		t.Errorf("tools_filtered = %d, want 1", entries[0].ToolsFiltered)
 	}
 }
 
