@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- `gateway/bench_test.go`: reproducible benchmark comparing a `tools/call` round trip direct-to-upstream vs. through the gateway (minimal config), with measured overhead documented in the README's new Benchmark section.
+
 ## [0.4.0] - 2026-07-17
 
 M3b: the response side — tools/list filtering, inline tool-schema

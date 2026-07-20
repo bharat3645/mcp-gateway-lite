@@ -188,6 +188,23 @@ Unknown config fields are rejected — a typo fails loudly instead of silently d
 - `X-Forwarded-For/Host/Proto` are set on upstream requests; `Authorization` and other headers pass through untouched.
 - `/healthz` and `.well-known` reads are not audited — the audit log is MCP traffic plus route probes, not liveness noise.
 
+## Benchmark: proxy overhead vs. no gateway
+
+`gateway/bench_test.go` measures the same `tools/call` round trip two ways: straight to an `httptest` upstream, and through a real `gateway.Gateway` (minimal config — one upstream, no rate limit, no policy, no lock, audit sink discarded) sitting in front of the same upstream. Both benchmarks hit real `net/http` servers over the loopback interface; nothing is mocked below the HTTP layer.
+
+```sh
+go test -run '^$' -bench . -benchtime=2s ./gateway/...
+```
+
+Measured on this machine (Apple M4, `go1.26.5 darwin/arm64`), 2026-07-20:
+
+| | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| Direct to upstream | 29,266 | 7,621 | 85 |
+| Through the gateway | 69,852 | 53,073 | 222 |
+
+About 40µs and 45KB of added allocation per request in this minimal-config shape — the cost of routing, JSON-RPC method/tool-name extraction for the audit line, and the `httputil.ReverseProxy` hop itself. This is a per-process microbenchmark, not a network-conditions benchmark: it says nothing about TLS termination, real upstream latency, or concurrent-connection behavior, and per-request cost rises further once rate limiting, tool policies, or `tools_lock` verification are configured (each adds its own bounded amount of work on the request path). Re-run the command above on your own hardware and config shape before trusting these numbers for a capacity plan.
+
 ## What's not here (yet)
 
 1. **Auth:** the gateway forwards credentials and advertises metadata; it does not mint or verify tokens. Put it behind your SSO-terminating proxy.
