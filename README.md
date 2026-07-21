@@ -13,6 +13,26 @@ agent/client ──▶ mcp-gateway-lite ──▶ your MCP servers
                      └──◀ mcp-sentinel.lock  (tool schemas, pinned)
 ```
 
+That's the deployment topology; the request/response pipeline inside has
+a specific enforcement order, which is what actually determines behavior:
+
+```mermaid
+flowchart LR
+    subgraph request["on the way in"]
+        direction LR
+        rl["rate limit\n(token bucket)"] --> pol["tool policy\n(tools_allow/deny)"]
+    end
+    subgraph response["on the way back"]
+        direction LR
+        lock["tools_lock\n(drift check)"] --> filt["tools/list\nfiltering"]
+    end
+    request -- "429 or 403\nstop here" --> deny(["blocked + audited,\nnever reaches upstream"])
+    request -- ok --> upstream[("your MCP\nserver")]
+    upstream --> response
+    response -- "drift found" --> block(["blocked or audited\n(enforce/warn mode)"])
+    response -- ok --> client(["client sees the\nfiltered, verified response"])
+```
+
 ## Why
 
 MCP adoption ran ahead of MCP operations. Most deployments today wire agents straight into MCP servers with no audit trail, no choke point, and no place to hang policy. This gateway is the minimal missing piece:
@@ -96,6 +116,64 @@ Two deliberate choices, documented honestly:
 
 - Client identity from `RemoteAddr` is not trustworthy behind proxies, so there is no per-IP mode.
 - Limited requests are rejected **before the body is read**, so a flood of oversized bodies can't consume gateway bandwidth. The tradeoff: 429 audit entries carry no `rpc_*` fields.
+
+## Example: policies and rate limiting, actually happening
+
+Everything above is prose plus one bare audit-log line. Here's the real
+thing: a real compiled binary, a real stub upstream, real `curl` requests -
+config is `example.config.json`'s `files` upstream with `rate_limit`
+tightened to `{"requests_per_second": 2, "burst": 2}` and
+`"tools_deny": ["delete_file"]` for a fast demo.
+
+**`tools/list` is filtered** - the upstream really has 3 tools, the client
+only ever sees 2:
+
+```
+$ curl -s http://127.0.0.1:8399/mcp/files -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+{"jsonrpc":"2.0","id":1,"result":{"tools":[
+  {"name":"read_file", ...},
+  {"name":"search", ...}
+]}}
+```
+
+**A denied tool is blocked before it ever reaches the upstream:**
+
+```
+$ curl -si http://127.0.0.1:8399/mcp/files -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_file","arguments":{"path":"/etc/passwd"}}}'
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32003,"message":"tool blocked by policy: delete_file"}}
+```
+
+**Rate limiting - `burst: 2`, so the 3rd request in a row gets 429:**
+
+```
+$ for i in 1 2 3; do curl -si http://127.0.0.1:8398/mcp/files -d "{\"jsonrpc\":\"2.0\",\"id\":$i,\"method\":\"ping\"}" | head -1; done
+HTTP/1.1 200 OK
+HTTP/1.1 200 OK
+HTTP/1.1 429 Too Many Requests
+```
+
+3rd request's real body and `Retry-After` header:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+{"jsonrpc":"2.0","id":null,"error":{"code":-32002,"message":"rate limited"}}
+```
+
+And the real `audit.jsonl` for that 3-request sequence - note the 429 line
+really does carry no `rpc_methods`/`rpc_ids`, exactly as documented above:
+
+```json
+{"ts":"2026-07-21T08:26:05.763Z","upstream":"files","session_id":"demo-session","rpc_methods":["ping"],"rpc_ids":["1"],"status":200,"bytes_in":40,"bytes_out":74,"duration_ms":0.972}
+{"ts":"2026-07-21T08:26:05.776Z","upstream":"files","session_id":"demo-session","rpc_methods":["ping"],"rpc_ids":["2"],"status":200,"bytes_in":40,"bytes_out":74,"duration_ms":0.599}
+{"ts":"2026-07-21T08:26:05.784Z","upstream":"files","session_id":"demo-session","status":429,"bytes_in":0,"bytes_out":0,"duration_ms":0,"error":"rate limited"}
+```
+
+Reproduce this yourself: `ci/upstream_stub.py HOST PORT`, a config with
+`rate_limit`/`tools_deny` set as above, then the three `curl` calls.
 
 ## Configuration
 

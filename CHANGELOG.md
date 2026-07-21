@@ -8,6 +8,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `gateway/bench_test.go`: reproducible benchmark comparing a `tools/call` round trip direct-to-upstream vs. through the gateway (minimal config), with measured overhead documented in the README's new Benchmark section.
+- README: real request/response transcripts (real compiled binary, real stub upstream, real `curl`) showing `tools/list` filtering, a denied-tool `403`/`-32003`, and rate-limit `429`/`Retry-After` plus the real `audit.jsonl` it produces — previously only described in prose plus one bare audit-log line, and the only place a full transcript existed was `ci/smoke.sh`, not something a reader would see.
+- README: a Mermaid diagram of the actual request/response enforcement pipeline (rate limit → policy check on the way in; lock verification → filtering on the way back), next to the existing deployment-topology diagram which didn't show this ordering. Verified against `gateway/gateway.go`'s real control flow (rate-limit check precedes the policy block by line order; the lock-then-filter order is stated directly in a source comment) before drawing it, not assumed.
 
 ## [0.4.0] - 2026-07-17
 
