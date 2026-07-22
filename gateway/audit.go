@@ -60,6 +60,29 @@ type Entry struct {
 	// error, in warn mode it passed through.
 	ToolsDrift bool `json:"tools_drift,omitempty"`
 
+	// PromptProofVerdict is the worst promptproof verdict across this
+	// request's scanned tools/call results ("suspicious"/"dangerous"),
+	// empty if nothing was scanned or everything came back ok.
+	PromptProofVerdict string `json:"promptproof_verdict,omitempty"`
+
+	// PromptProofScore is the promptproof aggregate score for the worst
+	// scanned result.
+	PromptProofScore int `json:"promptproof_score,omitempty"`
+
+	// PromptProofCategories lists the promptproof finding categories seen
+	// (metadata only — never the matched content).
+	PromptProofCategories []string `json:"promptproof_categories,omitempty"`
+
+	// PromptProofBlocked reports that a tools/call result was replaced
+	// with a JSON-RPC -32005 error because it met the configured
+	// threshold under the block action.
+	PromptProofBlocked bool `json:"promptproof_blocked,omitempty"`
+
+	// PromptProofError records a scanner failure (coprocess error or
+	// timeout). The result passes through unscanned (fail-open); the
+	// error is surfaced here so a broken scanner is visible.
+	PromptProofError string `json:"promptproof_error,omitempty"`
+
 	// Status is the HTTP status returned to the client.
 	Status int `json:"status"`
 

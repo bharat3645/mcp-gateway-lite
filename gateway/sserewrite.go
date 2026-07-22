@@ -240,7 +240,7 @@ func (r *sseRewriter) finishEvent(blank []byte) {
 		return
 	}
 	data := bytes.Join(r.evData, []byte("\n"))
-	o := r.st.examineMessage(data)
+	o := r.st.handleMessage(data)
 	switch o.verdict {
 	case msgRewrite:
 		r.emitReplaced(o.out, blank)

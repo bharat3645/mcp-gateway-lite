@@ -55,6 +55,43 @@ type LockConfig struct {
 	Mode string `json:"mode,omitempty"`
 }
 
+// PromptProofConfig wires the promptproof data-plane scanner
+// (https://github.com/bharat3645/promptproof) into one upstream's response
+// path: the untrusted content in tools/call *results* is scanned for
+// prompt-injection / exfiltration signals before it reaches the client
+// (the agent). It is opt-in and off by default — an absent block means no
+// scanning and byte-identical behavior to a gateway without this feature.
+type PromptProofConfig struct {
+	// Enabled turns scanning on for this upstream. Default false.
+	Enabled bool `json:"enabled"`
+
+	// Binary is the promptproof executable to run as a `serve`
+	// coprocess. Default "promptproof" (resolved on PATH).
+	Binary string `json:"binary,omitempty"`
+
+	// Threshold is the minimum verdict that triggers Action:
+	// "suspicious" or "dangerous" (default). "dangerous" only acts on
+	// high-confidence findings; "suspicious" also acts on lone lexical
+	// signals (higher recall, more false positives).
+	Threshold string `json:"threshold,omitempty"`
+
+	// Action on a triggering verdict: "block" (default) replaces the
+	// tool result with a JSON-RPC -32005 error so the poisoned content
+	// never reaches the model; "flag" passes the result through but
+	// audits the verdict and sets an X-PromptProof-Verdict response
+	// header (JSON responses only).
+	Action string `json:"action,omitempty"`
+
+	// SuspiciousAt / DangerousAt tune promptproof's underlying score
+	// thresholds (passed to `serve`). 0 = promptproof's defaults.
+	SuspiciousAt int `json:"suspicious_at,omitempty"`
+	DangerousAt  int `json:"dangerous_at,omitempty"`
+
+	// Pool is the number of `promptproof serve` coprocesses kept warm
+	// for this upstream (max concurrent scans). Default 2.
+	Pool int `json:"pool,omitempty"`
+}
+
 // Upstream describes one MCP server behind the gateway.
 type Upstream struct {
 	// Name is the route segment: requests to /mcp/<Name> and any
@@ -91,6 +128,11 @@ type Upstream struct {
 	// ToolsLock, when set, verifies tools/list responses against a
 	// sentinel-format lockfile (the rug-pull check, inline).
 	ToolsLock *LockConfig `json:"tools_lock,omitempty"`
+
+	// PromptProof, when set with enabled=true, scans tools/call result
+	// content for prompt-injection / exfiltration signals. Off by
+	// default.
+	PromptProof *PromptProofConfig `json:"promptproof,omitempty"`
 
 	// AuthorizationServers is advertised in the generated RFC 9728
 	// protected-resource metadata for this upstream.
@@ -210,6 +252,24 @@ func (c *Config) Validate() error {
 			case "", "enforce", "warn":
 			default:
 				return fmt.Errorf("upstream %q: tools_lock.mode must be \"enforce\" or \"warn\", got %q", u.Name, u.ToolsLock.Mode)
+			}
+		}
+		if pp := u.PromptProof; pp != nil {
+			switch pp.Threshold {
+			case "", "suspicious", "dangerous":
+			default:
+				return fmt.Errorf("upstream %q: promptproof.threshold must be \"suspicious\" or \"dangerous\", got %q", u.Name, pp.Threshold)
+			}
+			switch pp.Action {
+			case "", "block", "flag":
+			default:
+				return fmt.Errorf("upstream %q: promptproof.action must be \"block\" or \"flag\", got %q", u.Name, pp.Action)
+			}
+			if pp.SuspiciousAt < 0 || pp.DangerousAt < 0 {
+				return fmt.Errorf("upstream %q: promptproof score thresholds must be >= 0", u.Name)
+			}
+			if pp.Pool < 0 {
+				return fmt.Errorf("upstream %q: promptproof.pool must be >= 0", u.Name)
 			}
 		}
 		for _, as := range u.AuthorizationServers {

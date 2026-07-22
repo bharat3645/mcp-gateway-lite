@@ -47,6 +47,30 @@ type rewriteState struct {
 	// note records the first noteworthy processing outcome for the
 	// audit entry.
 	note string
+
+	// scanner scans tools/call result content for prompt-injection /
+	// exfiltration signals. nil means no scanning for this request.
+	scanner *Scanner
+
+	// scanIDs holds the raw ids of this request's tools/call messages;
+	// only responses to these are scanned.
+	scanIDs []string
+
+	// scanVerdict is the worst verdict seen, scanScore/scanCategories the
+	// accompanying metadata, for the audit entry.
+	scanVerdict    string
+	scanScore      int
+	scanCategories []string
+
+	// scanBlocked reports that at least one tools/call result was
+	// replaced with a -32005 error. scanFlagged reports a triggering
+	// verdict under the flag action (passed through, audited).
+	scanBlocked bool
+	scanFlagged bool
+
+	// scanErr records the first scanner failure (fail-open: the result
+	// still passes through).
+	scanErr string
 }
 
 // noteOnce records the first noteworthy processing outcome.
@@ -75,6 +99,106 @@ func (st *rewriteState) strictCode() int {
 func (st *rewriteState) hasID(raw []byte) bool {
 	for _, id := range st.ids {
 		if id == string(raw) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasScanID reports whether raw is the id of one of the request's
+// tools/call messages (whose result should be scanned by promptproof).
+func (st *rewriteState) hasScanID(raw []byte) bool {
+	for _, id := range st.scanIDs {
+		if id == string(raw) {
+			return true
+		}
+	}
+	return false
+}
+
+// handleMessage routes one JSON-RPC response message to the right
+// processing pass by its id: a tools/list result is verified/filtered
+// (examineMessage); a tools/call result is scanned (scanMessage). A
+// message that matches neither passes untouched. The two id sets are
+// disjoint (different requests), so a message goes to at most one pass.
+func (st *rewriteState) handleMessage(m json.RawMessage) msgOutcome {
+	if st.scanner != nil && len(st.scanIDs) > 0 {
+		var probe struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if err := json.Unmarshal(m, &probe); err == nil && len(probe.ID) > 0 && st.hasScanID(probe.ID) {
+			return st.scanMessage(m)
+		}
+	}
+	return st.examineMessage(m)
+}
+
+// scanMessage scans the untrusted content of one tools/call result. On a
+// triggering verdict it either blocks (replaces the result with a -32005
+// JSON-RPC error) or flags (passes through, records metadata + sets a
+// response header via the caller). A scanner failure fails open: the
+// result passes through and the error is audited — a scanner that cannot
+// answer must not silently drop legitimate tool output.
+func (st *rewriteState) scanMessage(m json.RawMessage) msgOutcome {
+	var probe rpcResponseProbe
+	if err := json.Unmarshal(m, &probe); err != nil {
+		return msgOutcome{verdict: msgPass, invalid: true}
+	}
+	if len(probe.Error) > 0 && string(probe.Error) != "null" {
+		// An error response carries no tool output to trust.
+		return msgOutcome{verdict: msgPass}
+	}
+	if len(probe.Result) == 0 {
+		return msgOutcome{verdict: msgPass}
+	}
+	var strs []string
+	collectStrings(probe.Result, &strs)
+	content := strings.Join(strs, "\n")
+
+	res, err := st.scanner.Scan(content)
+	if err != nil {
+		if st.scanErr == "" {
+			st.scanErr = err.Error()
+		}
+		st.noteOnce("promptproof scan error: " + err.Error())
+		return msgOutcome{verdict: msgPass}
+	}
+	st.recordScan(res)
+
+	if !st.scanner.triggers(res.Verdict) {
+		return msgOutcome{verdict: msgPass}
+	}
+	if st.scanner.action == "flag" {
+		st.scanFlagged = true
+		return msgOutcome{verdict: msgPass}
+	}
+	st.scanBlocked = true
+	reason := fmt.Sprintf("tool result blocked by promptproof: %s (score %d)", res.Verdict, res.Score)
+	st.noteOnce(reason)
+	return msgOutcome{verdict: msgBlock, id: probe.ID, code: promptProofBlockCode, reason: reason}
+}
+
+// recordScan folds one scan result into the request's worst-verdict
+// metadata for the audit entry. Clean (ok) results add nothing — the audit
+// only carries a promptproof verdict when there was something to report.
+func (st *rewriteState) recordScan(res scanResult) {
+	if verdictRank(res.Verdict) == 0 {
+		return
+	}
+	if verdictRank(res.Verdict) > verdictRank(st.scanVerdict) {
+		st.scanVerdict = res.Verdict
+		st.scanScore = res.Score
+	}
+	for _, c := range res.Categories {
+		if !containsString(st.scanCategories, c) {
+			st.scanCategories = append(st.scanCategories, c)
+		}
+	}
+}
+
+func containsString(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
 			return true
 		}
 	}
@@ -247,7 +371,15 @@ func modifyResponse(resp *http.Response) error {
 	ct := resp.Header.Get("Content-Type")
 	switch {
 	case strings.HasPrefix(ct, "application/json"):
-		return st.processJSONBody(resp)
+		err := st.processJSONBody(resp)
+		// flag action: the result passed through; annotate the response so
+		// a client can see the verdict without parsing the audit log. (SSE
+		// scans mid-stream, after headers are sent, so it cannot do this —
+		// the audit entry is the record there.)
+		if st.scanFlagged && st.scanVerdict != "" {
+			resp.Header.Set("X-PromptProof-Verdict", st.scanVerdict)
+		}
+		return err
 	case strings.HasPrefix(ct, "text/event-stream"):
 		resp.Body = newSSERewriter(resp.Body, st)
 		// Rewriting can change event sizes; the stream has no usable
@@ -298,7 +430,7 @@ func (st *rewriteState) processJSONBody(resp *http.Response) error {
 		changed := false
 		outMsgs := make([]json.RawMessage, len(msgs))
 		for i, m := range msgs {
-			o := st.examineMessage(m)
+			o := st.handleMessage(m)
 			switch o.verdict {
 			case msgBlock:
 				st.blockResponseCode(resp, o.code, o.reason)
@@ -322,7 +454,7 @@ func (st *rewriteState) processJSONBody(resp *http.Response) error {
 			out = joined
 		}
 	default:
-		o := st.examineMessage(json.RawMessage(body))
+		o := st.handleMessage(json.RawMessage(body))
 		switch o.verdict {
 		case msgBlock:
 			st.blockResponseCode(resp, o.code, o.reason)

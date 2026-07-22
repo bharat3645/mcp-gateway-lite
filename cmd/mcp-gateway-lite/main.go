@@ -102,6 +102,7 @@ func run(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	defer gw.Close()
 
 	srv := &http.Server{}
 	srv.Addr = cfg.Listen

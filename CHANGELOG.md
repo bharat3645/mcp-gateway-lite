@@ -3,10 +3,40 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.5.0] - 2026-07-22
 
 ### Added
 
+- **promptproof integration — data-plane scanning of `tools/call` results.**
+  Optional, per-upstream `promptproof` config wires the
+  [promptproof](https://github.com/bharat3645/promptproof) scanner into the
+  response path: the untrusted content in a `tools/call` result (the classic
+  indirect / second-order prompt-injection vector) is scanned for injection and
+  exfiltration signals before it reaches the client. It is **off by default** —
+  an absent `promptproof` block is byte-for-byte the old behavior. On a
+  triggering verdict the gateway either **blocks** the result (replaces it with
+  a JSON-RPC `-32005` error so the poison never reaches the model) or **flags**
+  it (passes through, sets `X-PromptProof-Verdict`, audits it). Configurable
+  `threshold` (`suspicious`/`dangerous`), `action` (`block`/`flag`), score
+  tuning, and coprocess `pool` size.
+- The gateway runs a small pool of `promptproof serve` coprocesses (promptproof
+  ≥ 0.2.0) and streams content through promptproof's length-prefixed framing —
+  it does **not** reimplement any detection logic. Scanning covers both the
+  `application/json` and `text/event-stream` response paths, and JSON-escaped
+  hidden characters in the result are decoded before scanning so covert channels
+  stay visible. Fail-open: a scanner error is audited and the result passes,
+  rather than taking the gateway down.
+- Audit entries gain metadata-only `promptproof_verdict` / `promptproof_score` /
+  `promptproof_categories` / `promptproof_blocked` / `promptproof_error` fields
+  (never the scanned content).
+- Real integration tests (`gateway/promptproof_test.go`) drive the actual
+  promptproof binary through the gateway with malicious and benign payloads
+  (block, flag, SSE, hidden-char decode, threshold, concurrency), and
+  `ci/smoke.sh` blocks a real poisoned tool result end-to-end. CI installs the
+  real promptproof from source (`cargo install --git`) and runs these with
+  `PROMPTPROOF_REQUIRED=1` so the integration is never silently skipped.
+- `BenchmarkThroughGatewayWithPromptProof` / `BenchmarkScannerScan` measure the
+  added latency (documented in the README's Benchmark section).
 - `gateway/bench_test.go`: reproducible benchmark comparing a `tools/call` round trip direct-to-upstream vs. through the gateway (minimal config), with measured overhead documented in the README's new Benchmark section.
 - README: real request/response transcripts (real compiled binary, real stub upstream, real `curl`) showing `tools/list` filtering, a denied-tool `403`/`-32003`, and rate-limit `429`/`Retry-After` plus the real `audit.jsonl` it produces — previously only described in prose plus one bare audit-log line, and the only place a full transcript existed was `ci/smoke.sh`, not something a reader would see.
 - README: a Mermaid diagram of the actual request/response enforcement pipeline (rate limit → policy check on the way in; lock verification → filtering on the way back), next to the existing deployment-topology diagram which didn't show this ordering. Verified against `gateway/gateway.go`'s real control flow (rate-limit check precedes the policy block by line order; the lock-then-filter order is stated directly in a source comment) before drawing it, not assumed.

@@ -181,6 +181,65 @@ echo '--- lock audit log ---'
 cat /tmp/audit-lock.jsonl
 grep -qF '"tools_drift":true' /tmp/audit-lock.jsonl
 
+echo "=== promptproof: scan tools/call results (real coprocess) ==="
+# Only run if the real promptproof binary is available. CI installs it and
+# sets PROMPTPROOF_BIN; skip cleanly otherwise so this stays a soft dep.
+PP_BIN=${PROMPTPROOF_BIN:-$(command -v promptproof || true)}
+if [ -z "$PP_BIN" ]; then
+  echo "SKIP: promptproof binary not found (set PROMPTPROOF_BIN)"
+else
+  echo "using promptproof: $PP_BIN"
+  cat > /tmp/pp.config.json <<EOF
+{
+  "listen": "127.0.0.1:8388",
+  "audit": {"path": "/tmp/audit-pp.jsonl"},
+  "upstreams": [
+    {"name": "files", "url": "http://$STUB_HOST:$STUB_PORT/mcp",
+     "promptproof": {"enabled": true, "binary": "$PP_BIN", "action": "block", "threshold": "dangerous"}}
+  ]
+}
+EOF
+  "$BIN" --config /tmp/pp.config.json &
+  GW4=$!
+  CLEANUP_PIDS+=("$GW4")
+  wait_for_healthz http://127.0.0.1:8388/healthz
+
+  # 1. A benign tool result passes through untouched (200, content intact).
+  BENIGN=$(curl -sf -X POST http://127.0.0.1:8388/mcp/files \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"clean"}}}')
+  echo "benign: $BENIGN"
+  echo "$BENIGN" | grep -qF '42 rows of customer records'
+
+  # 2. A poisoned tool result is blocked with -32005 and the injection text
+  #    never reaches the client.
+  CODE=$(curl -s -o /tmp/pp-blocked.json -w '%{http_code}' -X POST http://127.0.0.1:8388/mcp/files \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"poison"}}}')
+  echo "poison response ($CODE): $(cat /tmp/pp-blocked.json)"
+  test "$CODE" = "403"
+  grep -qF -- '-32005' /tmp/pp-blocked.json
+  if grep -qiF 'ignore all previous instructions' /tmp/pp-blocked.json; then
+    echo 'FAIL: injected tool content reached the client'
+    exit 1
+  fi
+  if grep -qF 'evil.example' /tmp/pp-blocked.json; then
+    echo 'FAIL: exfiltration URL reached the client'
+    exit 1
+  fi
+  kill "$GW4" && wait "$GW4" 2>/dev/null || true
+  echo '--- promptproof audit log ---'
+  cat /tmp/audit-pp.jsonl
+  grep -qF '"promptproof_blocked":true' /tmp/audit-pp.jsonl
+  grep -qF '"promptproof_verdict":"dangerous"' /tmp/audit-pp.jsonl
+  # metadata only: the scanned content must never be in the audit log
+  if grep -qiF 'ignore all previous instructions' /tmp/audit-pp.jsonl; then
+    echo 'FAIL: audit log leaked scanned tool content'
+    exit 1
+  fi
+  echo "ok - promptproof blocked the poisoned tool result, passed the benign one"
+fi
+
 echo "=== cross-check: real mcp-sentinel agrees with the gateway lockfile ==="
 git clone --depth 1 https://github.com/bharat3645/mcp-sentinel /tmp/sentinel
 python3 - <<'PY'

@@ -106,6 +106,49 @@ The two modes fail differently, on purpose:
 - **`tools_allow` is default-deny:** unparseable bodies and `tools/call` messages without an extractable tool name are blocked — and on the response side, an unparseable or oversized `tools/list` response is replaced with an error instead of passed through. An allowlist that fails open is theater.
 - **`tools_deny` is best-effort:** unparseable request bodies and unprocessable responses pass through; it is a guardrail, not a boundary.
 
+## Prompt-injection scanning of tool results (promptproof)
+
+Tool schemas can be locked (above), but the *content a tool returns* is
+untrusted at runtime — a compromised or hostile MCP server can smuggle
+instructions or exfiltration lures back into the agent's context through what
+looks like an ordinary `tools/call` result. This is the classic indirect /
+second-order prompt-injection path, and locking schemas does nothing about it.
+
+Per-upstream `promptproof` config wires the
+[promptproof](https://github.com/bharat3645/promptproof) data-plane scanner into
+the response path to inspect exactly that content:
+
+```json
+{
+  "name": "files",
+  "url": "http://127.0.0.1:3001/mcp",
+  "promptproof": {"enabled": true, "action": "block", "threshold": "dangerous"}
+}
+```
+
+The gateway extracts the string values from each `tools/call` result and scans
+them; on a verdict at or above `threshold` (`suspicious` or `dangerous`) it
+either **blocks** the result — replacing it with a JSON-RPC `-32005` error so the
+poison never reaches the model — or **flags** it (passes through, sets an
+`X-PromptProof-Verdict` response header, audits it). It handles both JSON and
+SSE responses, and decodes JSON-escaped hidden characters (zero-width, bidi,
+Unicode-tag smuggling) in the result before scanning, so a covert channel the
+raw bytes would hide stays visible.
+
+It is **off by default**: an upstream with no `promptproof` block behaves
+byte-for-byte as before. Detection is not reimplemented here — the gateway runs
+a small pool of `promptproof serve` coprocesses (promptproof ≥ 0.2.0) and streams
+content through them, so the scanner is the single source of truth. A scanner
+error **fails open** (audited, result passes) rather than taking the gateway
+down. The audit entry records metadata only — `promptproof_verdict`,
+`promptproof_score`, `promptproof_categories`, `promptproof_blocked` — never the
+scanned content.
+
+Options: `threshold` (`suspicious`/`dangerous`, default `dangerous`), `action`
+(`block`/`flag`, default `block`), `suspicious_at`/`dangerous_at` (tune
+promptproof's score cutoffs), `pool` (warm coprocesses, default 2), `binary`
+(path to `promptproof`, default resolved on `PATH`).
+
 ## Rate limiting
 
 Per-upstream token bucket: `burst` requests go through back-to-back, then `requests_per_second` sustained. Exhaustion returns `429` with a `Retry-After` header and JSON-RPC error `-32002`, and writes an audit entry (`status: 429`, `error: "rate limited"`, session id included so throttled clients stay attributable).
@@ -235,6 +278,11 @@ Unknown config fields are rejected — a typo fails loudly instead of silently d
 | `rpc_invalid` | Body wasn't parseable JSON (or exceeded the 1 MiB metadata cap). Request is proxied regardless (unless an allowlist policy applies) |
 | `tools_filtered` | Tools removed from this request's `tools/list` response by policy |
 | `tools_drift` | `tools_lock` verification failed; `error` carries the reason |
+| `promptproof_verdict` | Worst promptproof verdict across scanned `tools/call` results (`suspicious`/`dangerous`); absent when nothing triggered |
+| `promptproof_score` | promptproof aggregate score for the worst result |
+| `promptproof_categories` | Finding categories seen (metadata only, never the matched content) |
+| `promptproof_blocked` | A `tools/call` result was replaced with a `-32005` error |
+| `promptproof_error` | Scanner failure; the result passed through unscanned (fail-open) |
 | `status` | HTTP status returned to the client |
 | `sse` | Response was `text/event-stream` |
 | `bytes_in`, `bytes_out` | Body sizes as seen by the gateway (out = as sent to the client, post-filtering) |
@@ -249,6 +297,7 @@ Unknown config fields are rejected — a typo fails loudly instead of silently d
 | `-32002` | Rate limited (with `Retry-After`) |
 | `-32003` | Tool policy block (request or strict response processing) |
 | `-32004` | Tool-schema drift (lock enforcement) |
+| `-32005` | `tools/call` result blocked by promptproof (injection/exfiltration verdict) |
 
 ## .well-known metadata
 
@@ -282,6 +331,33 @@ Measured on this machine (Apple M4, `go1.26.5 darwin/arm64`), 2026-07-20:
 | Through the gateway | 69,852 | 53,073 | 222 |
 
 About 40µs and 45KB of added allocation per request in this minimal-config shape — the cost of routing, JSON-RPC method/tool-name extraction for the audit line, and the `httputil.ReverseProxy` hop itself. This is a per-process microbenchmark, not a network-conditions benchmark: it says nothing about TLS termination, real upstream latency, or concurrent-connection behavior, and per-request cost rises further once rate limiting, tool policies, or `tools_lock` verification are configured (each adds its own bounded amount of work on the request path). Re-run the command above on your own hardware and config shape before trusting these numbers for a capacity plan.
+
+### promptproof scanning overhead
+
+`BenchmarkThroughGatewayWithPromptProof` repeats the through-the-gateway
+benchmark with scanning enabled (block action, warm coprocess pool), pushing a
+realistic ~150-byte clean tool result through promptproof each call.
+`BenchmarkScannerScan` isolates just the coprocess round trip (frame out,
+verdict in) with no HTTP in the path. Measured on the same machine (Apple M4,
+`go1.26.5`, promptproof 0.2.0 release build, 2026-07-22):
+
+| | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| Through the gateway (no scan) | ~72,000 | 50,939 | 222 |
+| Through the gateway + promptproof | ~120,000 | 61,419 | 333 |
+| Isolated `Scanner.Scan` round trip | ~29,000 | 1,104 | 18 |
+
+So scanning adds roughly **~48µs per `tools/call`** on top of the gateway path —
+about 0.05 ms. Because the scanner is a warm coprocess (not a process spawned per
+call), the cost is the ~29µs frame-write / scan / verdict-read round trip plus
+the result-parsing in the response path, not the ~1–5 ms a fork-per-scan would
+cost. Overhead scales with result size and with pool contention under
+concurrency (raise `pool` to widen it). Reproduce with:
+
+```sh
+PROMPTPROOF_BIN=$(command -v promptproof) \
+  go test -run '^$' -bench 'PromptProof|ScannerScan|ThroughGateway' -benchtime=1s ./gateway/...
+```
 
 ## What's not here (yet)
 

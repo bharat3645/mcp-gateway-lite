@@ -28,7 +28,7 @@ import (
 
 // Version is the mcp-gateway-lite release version, shared by the CLI
 // and the lock-init client.
-const Version = "0.4.0"
+const Version = "0.5.0"
 
 // maxRPCPeek caps how much of a request body is buffered for JSON-RPC
 // metadata extraction, and how much of a tools/list response (or SSE
@@ -81,6 +81,10 @@ type Gateway struct {
 
 	// locks maps upstream name to its prepared tools_lock.
 	locks map[string]*preparedLock
+
+	// scanners maps upstream name to its promptproof scanner; a missing
+	// entry means tools/call results are not scanned for that upstream.
+	scanners map[string]*Scanner
 }
 
 // New validates cfg and builds a Gateway. The auditor must not be
@@ -100,6 +104,7 @@ func New(cfg Config, auditor *Auditor) (*Gateway, error) {
 	g.sessionLimits = make(map[string]*sessionLimiter)
 	g.policies = make(map[string]*toolPolicy)
 	g.locks = make(map[string]*preparedLock)
+	g.scanners = make(map[string]*Scanner)
 	lockCache := make(map[string]*lockFile)
 	for _, u := range cfg.Upstreams {
 		p, err := newProxy(u)
@@ -125,8 +130,28 @@ func New(cfg Config, auditor *Auditor) (*Gateway, error) {
 			}
 			g.locks[u.Name] = pl
 		}
+		if u.PromptProof != nil && u.PromptProof.Enabled {
+			sc, err := newScanner(u.PromptProof)
+			if err != nil {
+				g.Close()
+				return nil, fmt.Errorf("gateway: upstream %q: %w", u.Name, err)
+			}
+			g.scanners[u.Name] = sc
+		}
 	}
 	return g, nil
+}
+
+// Close releases resources held by the gateway — currently the
+// promptproof scanner coprocess pools. It is safe to call on a
+// partially-built gateway (New calls it on a mid-construction error).
+func (g *Gateway) Close() error {
+	for _, sc := range g.scanners {
+		if sc != nil {
+			sc.Close()
+		}
+	}
+	return nil
 }
 
 // ServeHTTP implements http.Handler.
@@ -250,10 +275,21 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// way back: verification against the lock, then filtering so
 	// clients never see tools they cannot call.
 	var rw *rewriteState
-	pol, lk := g.policies[name], g.locks[name]
-	if (pol != nil || lk != nil) && len(sum.ToolsListIDs) > 0 {
+	pol, lk, sc := g.policies[name], g.locks[name], g.scanners[name]
+	needList := (pol != nil || lk != nil) && len(sum.ToolsListIDs) > 0
+	needScan := sc != nil && len(sum.ToolsCallIDs) > 0
+	if needList || needScan {
 		strict := (pol != nil && pol.allow != nil) || (lk != nil && lk.enforce)
-		rw = &rewriteState{ids: sum.ToolsListIDs, policy: pol, lock: lk, strict: strict}
+		rw = &rewriteState{strict: strict}
+		if needList {
+			rw.ids = sum.ToolsListIDs
+			rw.policy = pol
+			rw.lock = lk
+		}
+		if needScan {
+			rw.scanner = sc
+			rw.scanIDs = sum.ToolsCallIDs
+		}
 	}
 
 	rec := &countingWriter{ResponseWriter: w}
@@ -283,6 +319,11 @@ func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if rw != nil {
 		e.ToolsFiltered = rw.filtered
 		e.ToolsDrift = rw.drift
+		e.PromptProofVerdict = rw.scanVerdict
+		e.PromptProofScore = rw.scanScore
+		e.PromptProofCategories = rw.scanCategories
+		e.PromptProofBlocked = rw.scanBlocked
+		e.PromptProofError = rw.scanErr
 		if rw.note != "" && e.Error == "" {
 			e.Error = rw.note
 		}
