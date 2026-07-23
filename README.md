@@ -258,6 +258,12 @@ Reproduce this yourself: `ci/upstream_stub.py HOST PORT`, a config with
 | `upstreams[].tools_lock.mode` | `enforce` (block drift) or `warn` (audit only) | `enforce` |
 | `upstreams[].authorization_servers` | Advertised in generated RFC 9728 metadata | none |
 | `upstreams[].resource_name` | Human-readable name in generated metadata | none |
+| `upstreams[].promptproof.enabled` | Scan `tools/call` results for prompt injection (see section above) | `false` |
+| `upstreams[].promptproof.threshold` | Minimum verdict that acts: `suspicious` or `dangerous` | `dangerous` |
+| `upstreams[].promptproof.action` | `block` (replace result with `-32005`) or `flag` (pass + header + audit) | `block` |
+| `upstreams[].promptproof.suspicious_at` / `dangerous_at` | Tune promptproof's score cutoffs | promptproof defaults |
+| `upstreams[].promptproof.pool` | Warm `promptproof serve` coprocesses | `2` |
+| `upstreams[].promptproof.binary` | Path to the `promptproof` executable | resolved on `PATH` |
 
 Unknown config fields are rejected — a typo fails loudly instead of silently disabling an option. Flags `--listen`, `--audit`, and repeatable `--upstream name=url` override/extend the file; `--check` validates and exits; `--lock-init --lock-file <path>` captures upstream tools into a lockfile and exits.
 
