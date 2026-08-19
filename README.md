@@ -44,6 +44,20 @@ MCP adoption ran ahead of MCP operations. Most deployments today wire agents str
 - **Rug-pull detection, inline** — `tools_lock` verifies every `tools/list` response against a pinned lockfile before the client sees it; a silently changed tool description is blocked (or audited) instead of steering your agent.
 - **`.well-known` for servers that lack it** — generated [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) protected-resource metadata per upstream.
 
+## Demo
+
+`asciinema play demo/mcp-gateway-lite-demo.cast` — a real terminal session
+against the compiled binary and the real `ci/upstream_stub.py`, driving the
+rug-pull containment story end to end: lock a clean `tools/list`, watch the
+gateway pass it through untouched, then watch the upstream silently rewrite
+`read_file`'s description (the postmark-mcp attack shape) and the gateway
+catch the drift inline — `-32004`, HTTP 403, poisoned text never reaching
+the client — while a separately denied tool (`delete_file`) is blocked at
+call time with `-32003`, and a final `grep` of the audit log proves neither
+blocked call's arguments were ever recorded. `demo/run_demo.sh` is the exact
+driver script, committed alongside the recording so it's reproducible, not
+just watchable.
+
 ## Privacy by construction
 
 The audit log records **metadata only**. JSON-RPC `params` and tool `arguments` are never written — only method names, request ids, and `tools/call` tool names. This is enforced by the extraction code (it structurally cannot emit params) and pinned by tests and a CI check that fails if an argument value ever appears in the audit output.
