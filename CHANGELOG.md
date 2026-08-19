@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Demo recording** (`demo/mcp-gateway-lite-demo.cast` + `demo/run_demo.sh`) —
+  a real asciinema terminal session against the compiled binary and
+  `ci/upstream_stub.py`, driving the rug-pull containment story end to end:
+  lock a clean `tools/list`, a silently drifted `read_file` description
+  caught inline and blocked (`-32004`), a denied tool blocked at call time
+  (`-32003`), and a final audit-log check proving neither blocked call's
+  arguments were recorded.
+
 ## [0.5.0] - 2026-07-22
 
 ### Added
