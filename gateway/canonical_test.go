@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -144,5 +145,73 @@ func TestEmptyEntryHashMatchesSentinel(t *testing.T) {
 	const want = "sha256:a70d268c811ce84d86639a41958f2b208df10b7868c9902333dae9a65a259a88"
 	if got := emptyEntryHash(); got != want {
 		t.Errorf("emptyEntryHash = %s, want %s", got, want)
+	}
+}
+
+// TestCanonicalRejectsReplacementChar pins down a real divergence from
+// mcp-sentinel found by cross-checking against the real Python
+// json.loads/json.dumps: encoding/json silently collapses both an
+// unpaired UTF-16 surrogate escape (e.g. a lone "\ud800" with no
+// following low surrogate) and raw invalid UTF-8 bytes into U+FFFD,
+// while Python either keeps an unpaired surrogate as a distinct code
+// point or raises UnicodeDecodeError for invalid UTF-8 before this
+// code ever runs. Two schemas differing only in which invalid
+// surrogate or byte they contain would otherwise decode to the
+// identical Go string and silently hash identically — a collision in
+// the one place this file exists to prevent. canonicalAppend must
+// refuse to hash any string containing U+FFFD rather than risk that.
+func TestCanonicalRejectsReplacementChar(t *testing.T) {
+	cases := []struct {
+		name string
+		doc  string
+	}{
+		{"unpaired high surrogate", `{"a": "` + "�" + `"}`},
+		{"literal replacement char in a map key", `{"` + "�" + `": 1}`},
+		{"nested inside an array", `{"a": [1, "x` + "�" + `y"]}`},
+	}
+	for _, tc := range cases {
+		v, err := decodeUseNumber([]byte(tc.doc))
+		if err != nil {
+			t.Fatalf("%s: decode: %v", tc.name, err)
+		}
+		var buf bytes.Buffer
+		err = canonicalAppend(&buf, v)
+		if err == nil {
+			t.Fatalf("%s: canonicalAppend succeeded (buf=%q), want errReplacementChar", tc.name, buf.String())
+		}
+		if !errors.Is(err, errReplacementChar) {
+			t.Errorf("%s: err = %v, want errReplacementChar", tc.name, err)
+		}
+	}
+}
+
+// TestUnpairedSurrogatesCollapseToTheSameString demonstrates the
+// concrete decode-time mechanism the fix above closes: two tool
+// schemas whose raw JSON differs only in *which* unpaired UTF-16
+// surrogate escape they carry — a lone high surrogate "\ud800" versus
+// a lone low surrogate "\udfff", neither followed by its pairing half
+// — are distinct, non-equal strings to Python's real json.loads (it
+// preserves each as its own code point), but decode to the exact same
+// Go string here, because encoding/json replaces any unpaired
+// surrogate with U+FFFD regardless of which one it was. That is what
+// makes a pre-decode (not post-decode) distinction impossible, and
+// why canonicalAppend must refuse U+FFFD outright (TestCanonical-
+// RejectsReplacementChar) rather than try to hash it.
+func TestUnpairedSurrogatesCollapseToTheSameString(t *testing.T) {
+	highSurrogate, err := decodeUseNumber([]byte(`{"a": "\ud800"}`))
+	if err != nil {
+		t.Fatalf("decode lone high surrogate: %v", err)
+	}
+	lowSurrogate, err := decodeUseNumber([]byte(`{"a": "\udfff"}`))
+	if err != nil {
+		t.Fatalf("decode lone low surrogate: %v", err)
+	}
+	a := highSurrogate.(map[string]any)["a"]
+	b := lowSurrogate.(map[string]any)["a"]
+	if a != "�" || b != "�" {
+		t.Fatalf("expected both unpaired surrogates to decode to U+FFFD; got %q and %q", a, b)
+	}
+	if a != b {
+		t.Fatalf("expected the two distinct malformed inputs to decode identically (that is the bug this guards against); got %q vs %q", a, b)
 	}
 }

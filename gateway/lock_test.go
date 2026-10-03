@@ -123,6 +123,41 @@ func TestLockDetailVerifySupportsPartialListings(t *testing.T) {
 	}
 }
 
+// TestVerifyFailsSafeOnUnhashableSchema exercises the live
+// tools/list-verification path (the same pl.verify call
+// responsefilter.go makes on every real request) with a tool schema
+// containing an unpaired UTF-16 surrogate escape. Before the
+// errReplacementChar guard in canonical.go, this would silently
+// compute *some* hash for the malformed schema — one that could
+// coincidentally match or mismatch the lock for reasons having
+// nothing to do with real drift, since Go cannot reproduce
+// mcp-sentinel's Python-side handling of the malformed input. The
+// fix must surface as an explicit "drift check failed" reason here,
+// which responsefilter.go's st.lock.enforce path already treats as
+// drift — the fail-safe behavior requires no change outside
+// canonical.go.
+func TestVerifyFailsSafeOnUnhashableSchema(t *testing.T) {
+	elems := toolElems(t, vectorTools)
+	tools, err := parseLockTools(elems)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail := map[string]string{}
+	for _, tool := range tools {
+		detail[tool.name] = tool.hash
+	}
+	pl := &preparedLock{enforce: true, detail: detail}
+
+	malformed := `{"name": "read_file", "description": "\ud800", "inputSchema": {}}`
+	reason := pl.verify(toolElems(t, []string{malformed}))
+	if reason == "" {
+		t.Fatal("expected a malformed (unpaired-surrogate) schema to be treated as drift, got clean verify")
+	}
+	if !strings.Contains(reason, "drift check failed") {
+		t.Errorf("reason = %q, want it to mention the check failing outright", reason)
+	}
+}
+
 func TestLoadLockFileErrors(t *testing.T) {
 	if _, err := loadLockFile(filepath.Join(t.TempDir(), "absent.lock")); err == nil {
 		t.Error("expected error for missing file")

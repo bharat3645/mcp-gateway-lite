@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // This file implements the canonical JSON form used by mcp-sentinel
@@ -23,6 +25,29 @@ import (
 // them (1e2 -> 100.0). For tool schemas, whose numbers are almost
 // always plain integers, the encodings agree; when they do not, the
 // failure mode is a spurious drift alarm, never a false match.
+//
+// A second, non-deliberate divergence exists at the decode step, not
+// here: Go's encoding/json silently collapses both invalid UTF-8
+// bytes and unpaired UTF-16 surrogate escapes (e.g. a lone "\ud800"
+// with no following low surrogate) into U+FFFD, while Python's
+// json.loads either preserves an unpaired surrogate as a distinct
+// code point or raises UnicodeDecodeError outright for invalid UTF-8.
+// Two inputs that differ only in which invalid byte or surrogate they
+// contain can therefore decode to the identical Go string and hash
+// identically here, while sentinel would treat them as different (or
+// reject one outright) — a silent hash collision in the one place
+// this file exists to prevent. errReplacementChar below closes that
+// by refusing to canonicalize (and therefore to hash) any string
+// containing U+FFFD at all, including a string that happens to
+// genuinely intend that code point: this tool has no way to tell the
+// two cases apart post-decode, and in a drift-detection primitive a
+// loud refusal is the correct failure mode, not a silent false match.
+// See TestCanonicalRejectsReplacementChar.
+
+// errReplacementChar is returned by canonicalAppend for any string
+// containing U+FFFD, since such a string cannot be canonicalized with
+// a guaranteed-accurate parity with mcp-sentinel's Python decoder.
+var errReplacementChar = errors.New("canonical: string contains U+FFFD (invalid UTF-8 or an unpaired surrogate escape); cannot guarantee a hash matching mcp-sentinel")
 
 // decodeUseNumber decodes one JSON value, preserving number literals.
 func decodeUseNumber(raw []byte) (any, error) {
@@ -53,6 +78,9 @@ func canonicalAppend(dst *bytes.Buffer, v any) error {
 	case json.Number:
 		dst.WriteString(t.String())
 	case string:
+		if strings.ContainsRune(t, utf8.RuneError) {
+			return errReplacementChar
+		}
 		appendPythonString(dst, t)
 	case []any:
 		dst.WriteByte('[')
@@ -77,6 +105,9 @@ func canonicalAppend(dst *bytes.Buffer, v any) error {
 		for i, k := range keys {
 			if i > 0 {
 				dst.WriteByte(',')
+			}
+			if strings.ContainsRune(k, utf8.RuneError) {
+				return errReplacementChar
 			}
 			appendPythonString(dst, k)
 			dst.WriteByte(':')
