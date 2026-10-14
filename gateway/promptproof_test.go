@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // findPromptproofBin locates the promptproof binary via PROMPTPROOF_BIN,
@@ -374,4 +375,70 @@ func lastEntry(t *testing.T, buf *syncBuffer) Entry {
 	t.Helper()
 	entries := waitForEntries(t, buf, 1)
 	return entries[len(entries)-1]
+}
+
+// slowStubScanner writes a tiny shell script that speaks just enough of
+// promptproof's `serve` framing to exercise Scanner/ppProc without the real
+// binary: read a length line, discard that many bytes, sleep (to hold a
+// ppProc checked out of the pool for a controlled window), then answer with
+// a fixed "ok" verdict. Used only for the Scanner/Close race test below,
+// which does not need real detection logic — the real binary is unsuitable
+// there because the test needs a deterministic delay to win a race window.
+func slowStubScanner(t *testing.T, delay string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stub-promptproof.sh")
+	script := "#!/bin/sh\n" +
+		"while IFS= read -r len; do\n" +
+		"  dd bs=1 count=\"$len\" of=/dev/null 2>/dev/null\n" +
+		"  sleep " + delay + "\n" +
+		"  printf '{\"verdict\":\"ok\",\"score\":0,\"findings\":[]}\\n'\n" +
+		"done\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestScanner_CloseDuringInFlightScanDoesNotPanic proves that Close can run
+// concurrently with a Scan that already checked a ppProc out of the pool
+// without panicking. Scanner.Close used to unconditionally close(s.pool);
+// if the in-flight Scan's coprocess answered after Close ran, Scan's
+// attempt to return the proc with `s.pool <- p` sent on a closed channel
+// and panicked, taking the whole gateway process down with it — reachable
+// for real via cmd/mcp-gateway-lite/main.go's shutdown path, where
+// srv.Shutdown's 5s deadline can elapse (and defer gw.Close() then run)
+// while a request's Scan call is still in flight.
+func TestScanner_CloseDuringInFlightScanDoesNotPanic(t *testing.T) {
+	bin := slowStubScanner(t, "0.15")
+	sc, err := newScanner(&PromptProofConfig{Enabled: true, Binary: bin, Pool: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	panicked := make(chan any, 1)
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				panicked <- r
+			}
+		}()
+		if _, err := sc.Scan("hello"); err != nil {
+			t.Logf("scan returned an error (acceptable): %v", err)
+		}
+	}()
+
+	// Give the goroutine time to check the only pool proc out before Close
+	// runs; the stub's 150ms sleep holds it checked-out well past that.
+	time.Sleep(50 * time.Millisecond)
+	sc.Close()
+	<-done
+
+	select {
+	case r := <-panicked:
+		t.Fatalf("Scan panicked when Close ran concurrently: %v", r)
+	default:
+	}
 }

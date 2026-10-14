@@ -73,7 +73,12 @@ type ppReport struct {
 // Scanner runs a pool of `promptproof serve` coprocesses and scans content
 // through them. It is safe for concurrent use: each Scan checks a
 // coprocess out of a channel, so at most poolSize scans run at once and
-// each coprocess speaks to one caller at a time.
+// each coprocess speaks to one caller at a time. It is also safe to Close
+// while a Scan is in flight: Close never closes the pool channel itself
+// (an in-flight Scan returning its ppProc afterwards would panic sending on
+// a closed channel), it only drains and shuts down procs currently sitting
+// idle in it; an in-flight Scan that finishes after Close has run sees
+// closed and shuts its own proc down directly instead of returning it.
 type Scanner struct {
 	bin       string
 	args      []string
@@ -82,6 +87,8 @@ type Scanner struct {
 	timeout   time.Duration
 	pool      chan *ppProc
 
+	mu        sync.Mutex
+	closed    bool
 	closeOnce sync.Once
 }
 
@@ -138,7 +145,18 @@ func newScanner(c *PromptProofConfig) (*Scanner, error) {
 func (s *Scanner) Scan(content string) (scanResult, error) {
 	p := <-s.pool
 	res, err := p.scan(content, s.timeout)
-	s.pool <- p
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		// Close has already run (or is running) and will never read from
+		// the pool again; shut this proc down ourselves instead of
+		// sending it back, which would panic if Close has closed the
+		// channel.
+		p.shutdown()
+	} else {
+		s.pool <- p
+	}
 	return res, err
 }
 
@@ -148,12 +166,20 @@ func (s *Scanner) triggers(verdict string) bool {
 	return verdictRank(verdict) >= s.threshold
 }
 
-// Close shuts every coprocess down. Safe to call more than once.
+// Close shuts every coprocess down. Safe to call more than once, and safe
+// to call while a Scan is in flight (see the Scanner doc comment).
 func (s *Scanner) Close() {
 	s.closeOnce.Do(func() {
-		close(s.pool)
-		for p := range s.pool {
-			p.shutdown()
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		for {
+			select {
+			case p := <-s.pool:
+				p.shutdown()
+			default:
+				return
+			}
 		}
 	})
 }
